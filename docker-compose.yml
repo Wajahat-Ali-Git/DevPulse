@@ -1,0 +1,4 @@
+version: '3.8'
+
+services:
+  # Add services here (e.g. postgres, redis, api, web)
