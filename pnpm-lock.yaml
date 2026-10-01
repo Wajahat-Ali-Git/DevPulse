@@ -14,6 +14,21 @@ importers:
 
   apps/api:
     dependencies:
+      '@devpulse/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@devpulse/database':
+        specifier: workspace:*
+        version: link:../../packages/database
+      '@devpulse/github':
+        specifier: workspace:*
+        version: link:../../packages/github
+      '@devpulse/logger':
+        specifier: workspace:*
+        version: link:../../packages/logger
+      '@devpulse/types':
+        specifier: workspace:*
+        version: link:../../packages/types
       '@nestjs/common':
         specifier: ^10.0.0
         version: 10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -91,6 +106,21 @@ importers:
 
   apps/worker:
     dependencies:
+      '@devpulse/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@devpulse/database':
+        specifier: workspace:*
+        version: link:../../packages/database
+      '@devpulse/github':
+        specifier: workspace:*
+        version: link:../../packages/github
+      '@devpulse/logger':
+        specifier: workspace:*
+        version: link:../../packages/logger
+      '@devpulse/types':
+        specifier: workspace:*
+        version: link:../../packages/types
       '@nestjs/common':
         specifier: ^10.0.0
         version: 10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -113,6 +143,50 @@ importers:
       '@types/node':
         specifier: ^20.3.1
         version: 20.19.43
+      typescript:
+        specifier: ^5.1.3
+        version: 5.9.3
+
+  packages/config:
+    devDependencies:
+      '@types/node':
+        specifier: ^20.3.1
+        version: 20.19.43
+      typescript:
+        specifier: ^5.1.3
+        version: 5.9.3
+
+  packages/database:
+    dependencies:
+      '@devpulse/config':
+        specifier: workspace:*
+        version: link:../config
+      '@devpulse/types':
+        specifier: workspace:*
+        version: link:../types
+    devDependencies:
+      typescript:
+        specifier: ^5.1.3
+        version: 5.9.3
+
+  packages/github:
+    dependencies:
+      '@devpulse/types':
+        specifier: workspace:*
+        version: link:../types
+    devDependencies:
+      typescript:
+        specifier: ^5.1.3
+        version: 5.9.3
+
+  packages/logger:
+    devDependencies:
+      typescript:
+        specifier: ^5.1.3
+        version: 5.9.3
+
+  packages/types:
+    devDependencies:
       typescript:
         specifier: ^5.1.3
         version: 5.9.3
