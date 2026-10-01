@@ -1,0 +1,15 @@
+{
+  "name": "@devpulse/logger",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b -w",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.1.3"
+  }
+}
