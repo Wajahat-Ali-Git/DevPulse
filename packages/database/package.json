@@ -5,15 +5,28 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsc -b",
+    "build": "prisma generate && tsc -b",
     "dev": "tsc -b -w",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prisma:generate": "prisma generate",
+    "db:migrate:dev": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "db:seed": "ts-node prisma/seed.ts"
+  },
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
   },
   "dependencies": {
     "@devpulse/config": "workspace:*",
-    "@devpulse/types": "workspace:*"
+    "@devpulse/types": "workspace:*",
+    "@prisma/client": "^5.22.0"
   },
   "devDependencies": {
+    "@types/node": "^26.6.4",
+    "prisma": "^5.22.0",
+    "ts-node": "^10.9.2",
     "typescript": "^5.1.3"
   }
 }

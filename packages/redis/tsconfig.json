@@ -12,12 +12,7 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*"],
-  "references": [
-    { "path": "../config" },
-    { "path": "../types" }
-  ]
+  "include": ["src/**/*"]
 }
