@@ -1,7 +1,11 @@
 import { NestFactory } from '@nestjs/core';
+import { config, validateConfig } from '@devpulse/config';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
+  // Validate central configuration at startup
+  validateConfig();
+
   const app = await NestFactory.create(AppModule);
 
   // Configure CORS
@@ -14,9 +18,10 @@ async function bootstrap() {
   // Configure Global API Prefix
   app.setGlobalPrefix('api/v1');
 
-  const port = process.env.PORT || 3000;
+  const port = config.app.port;
   await app.listen(port);
-  console.log(`DevPulse API running on: http://localhost:${port}/api/v1`);
+  console.log(`DevPulse API running in [${config.app.nodeEnv}] on: http://localhost:${port}/api/v1`);
 }
 
 bootstrap();
+
