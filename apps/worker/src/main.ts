@@ -1,14 +1,17 @@
 import { Logger as NestLogger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { Logger as DevPulseLogger } from '@devpulse/logger';
-import { defaultConfig } from '@devpulse/config';
+import { config, validateConfig } from '@devpulse/config';
 import { WorkerModule } from './worker.module';
 
 async function bootstrap() {
+  // Validate central configuration at startup
+  validateConfig();
+
   const nestLogger = new NestLogger('WorkerMain');
   const sharedLogger = new DevPulseLogger('Worker');
   
-  nestLogger.log(`Starting DevPulse Background Worker in [${defaultConfig.environment}] environment...`);
+  nestLogger.log(`Starting DevPulse Background Worker in [${config.app.nodeEnv}] environment...`);
   sharedLogger.info('Shared logger initialized for worker');
 
   const app = await NestFactory.createApplicationContext(WorkerModule);
