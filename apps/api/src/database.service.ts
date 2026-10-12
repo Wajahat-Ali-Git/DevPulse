@@ -1,10 +1,11 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { DatabaseClient, PrismaClient } from '@devpulse/database';
+import { Logger } from '@devpulse/logger';
 
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private readonly dbClient = new DatabaseClient();
-  private readonly logger = new Logger(DatabaseService.name);
+  private readonly logger = new Logger({ service: 'api', context: DatabaseService.name });
 
   get client(): PrismaClient {
     return this.dbClient.client;
