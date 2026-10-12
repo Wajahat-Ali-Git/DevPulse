@@ -1,5 +1,6 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import type Redis from 'ioredis';
+import { Logger } from '@devpulse/logger';
 import { RedisClient, RedisHealth } from '@devpulse/redis';
 
 /**
@@ -11,7 +12,7 @@ import { RedisClient, RedisHealth } from '@devpulse/redis';
 @Injectable()
 export class RedisService implements OnModuleInit, OnModuleDestroy {
   private readonly redisClient = new RedisClient();
-  private readonly logger = new Logger(RedisService.name);
+  private readonly logger = new Logger({ service: 'worker', context: RedisService.name });
 
   /** Exposes the raw ioredis instance for use by BullMQ queues/workers. */
   get client(): Redis {

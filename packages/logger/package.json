@@ -6,10 +6,12 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc -b",
+    "test": "tsc -b && node dist/logger.spec.js",
     "dev": "tsc -b -w",
     "clean": "rm -rf dist"
   },
   "devDependencies": {
+    "@types/node": "^20.3.1",
     "typescript": "^5.1.3"
   }
 }

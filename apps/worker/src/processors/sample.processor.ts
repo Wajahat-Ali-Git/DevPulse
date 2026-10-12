@@ -1,20 +1,29 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
+import { Logger, CorrelationContext } from '@devpulse/logger';
 import { JobData, JobResult } from '../jobs/job.interface';
 
 @Injectable()
 export class SampleProcessor {
-  private readonly logger = new Logger(SampleProcessor.name);
+  private readonly logger = new Logger({ service: 'worker', context: SampleProcessor.name });
 
   async process<T, R>(job: JobData<T>): Promise<JobResult<R>> {
-    this.logger.log(`Processing job ${job.name} (ID: ${job.id})...`);
-    
-    // Simulate background work
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    return CorrelationContext.run({ service: 'worker', jobId: job.id }, async () => {
+      this.logger.info(`Processing job ${job.name} (ID: ${job.id})...`, {
+        jobName: job.name,
+        jobId: job.id,
+      });
 
-    this.logger.log(`Completed job ${job.name} (ID: ${job.id})`);
-    return {
-      jobId: job.id,
-      success: true,
-    };
+      // Simulate background work
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      this.logger.info(`Completed job ${job.name} (ID: ${job.id})`, {
+        jobName: job.name,
+        jobId: job.id,
+      });
+      return {
+        jobId: job.id,
+        success: true,
+      };
+    });
   }
 }

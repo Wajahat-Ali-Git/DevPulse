@@ -1,5 +1,6 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { Queue, Job, ConnectionOptions } from 'bullmq';
+import { Logger } from '@devpulse/logger';
 import { RedisService } from '../redis/redis.service';
 import { JobData } from '../jobs/job.interface';
 
@@ -12,7 +13,7 @@ import { JobData } from '../jobs/job.interface';
  */
 @Injectable()
 export class QueueService implements OnModuleDestroy {
-  private readonly logger = new Logger(QueueService.name);
+  private readonly logger = new Logger({ service: 'worker', context: QueueService.name });
   private readonly queues = new Map<string, Queue>();
 
   constructor(private readonly redisService: RedisService) {}
