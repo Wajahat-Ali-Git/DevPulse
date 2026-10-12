@@ -5,7 +5,7 @@ import { User } from '@devpulse/types';
 
 @Injectable()
 export class AppService {
-  private logger = new Logger('AppService');
+  private logger = new Logger({ service: 'api', context: 'AppService' });
 
   getHello(): { message: string; timestamp: string; env: string; sampleUser: Partial<User> } {
     this.logger.info('Fetching hello payload in API');

@@ -1,6 +1,5 @@
-import { Logger as NestLogger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { Logger as DevPulseLogger } from '@devpulse/logger';
+import { Logger, NestLoggerAdapter } from '@devpulse/logger';
 import { config, validateConfig } from '@devpulse/config';
 import { WorkerModule } from './worker.module';
 
@@ -8,21 +7,24 @@ async function bootstrap() {
   // Validate central configuration at startup
   validateConfig();
 
-  const nestLogger = new NestLogger('WorkerMain');
-  const sharedLogger = new DevPulseLogger('Worker');
+  const workerLogger = new Logger({ service: 'worker', context: 'Bootstrap' });
+  const nestLoggerAdapter = new NestLoggerAdapter(workerLogger);
   
-  nestLogger.log(`Starting DevPulse Background Worker in [${config.app.nodeEnv}] environment...`);
-  sharedLogger.info('Shared logger initialized for worker');
+  workerLogger.info(`Starting DevPulse Background Worker in [${config.app.nodeEnv}] environment...`, {
+    environment: config.app.nodeEnv,
+  });
 
-  const app = await NestFactory.createApplicationContext(WorkerModule);
+  const app = await NestFactory.createApplicationContext(WorkerModule, {
+    logger: nestLoggerAdapter,
+  });
   app.enableShutdownHooks();
 
-  nestLogger.log('DevPulse Background Worker started successfully.');
+  workerLogger.info('DevPulse Background Worker started successfully.');
 
   const handleShutdown = async (signal: string) => {
-    nestLogger.log(`Received ${signal}. Shutting down worker gracefully...`);
+    workerLogger.info(`Received ${signal}. Shutting down worker gracefully...`);
     await app.close();
-    nestLogger.log('Worker shutdown complete.');
+    workerLogger.info('Worker shutdown complete.');
     process.exit(0);
   };
 
