@@ -1,7 +1,9 @@
 import { NestFactory } from '@nestjs/core';
+import { ValidationPipe } from '@nestjs/common';
 import { config, validateConfig } from '@devpulse/config';
 import { NestLoggerAdapter, Logger, createCorrelationMiddleware } from '@devpulse/logger';
 import { AppModule } from './app.module';
+import { GlobalExceptionFilter } from './common';
 
 async function bootstrap() {
   // Validate central configuration at startup
@@ -26,6 +28,18 @@ async function bootstrap() {
 
   // Configure Global API Prefix
   app.setGlobalPrefix('api/v1');
+
+  // Configure Global Validation Pipe
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: false,
+    }),
+  );
+
+  // Configure Global Exception Filter
+  app.useGlobalFilters(new GlobalExceptionFilter());
 
   const port = config.app.port;
   await app.listen(port);
