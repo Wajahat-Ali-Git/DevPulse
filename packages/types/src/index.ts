@@ -99,3 +99,38 @@ export interface ApiResponseSuccess<T = any> {
  */
 export type ApiResponse<T = any> = ApiResponseSuccess<T> | ApiResponseError;
 
+// ── Health-Check Types ───────────────────────────────────────────────
+
+/**
+ * Overall health status of the application or an individual component.
+ */
+export type HealthStatus = 'healthy' | 'unhealthy' | 'degraded';
+
+/**
+ * Health result for a single infrastructure component (e.g. PostgreSQL, Redis).
+ */
+export interface ComponentHealth {
+  status: HealthStatus;
+  /** Human-readable component name shown in the response. */
+  name: string;
+  /** Optional round-trip latency measurement in milliseconds. */
+  latencyMs?: number;
+  /** Free-form details — typically the error message when unhealthy. */
+  details?: string;
+}
+
+/**
+ * Top-level health-check response returned by the `/health` endpoints.
+ */
+export interface HealthCheckResponse {
+  status: HealthStatus;
+  /** ISO-8601 timestamp of when the check was performed. */
+  timestamp: string;
+  /** Uptime of the process in seconds. */
+  uptimeSeconds: number;
+  /** Environment the application is running in. */
+  environment: string;
+  /** Per-component breakdown (omitted on liveness probes). */
+  components?: ComponentHealth[];
+}
+
