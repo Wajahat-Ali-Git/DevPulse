@@ -1,27 +1,11 @@
-import { Repository } from '@devpulse/types';
-
-export interface GitHubClientOptions {
-  token: string;
-  baseUrl?: string;
-}
-
-export class GitHubClient {
-  private token: string;
-  private baseUrl: string;
-
-  constructor(options: GitHubClientOptions) {
-    this.token = options.token;
-    this.baseUrl = options.baseUrl || 'https://api.github.com';
-  }
-
-  async getRepository(owner: string, repo: string): Promise<Partial<Repository>> {
-    // Basic placeholder client implementation
-    return {
-      name: repo,
-      owner,
-      fullName: `${owner}/${repo}`,
-      url: `https://github.com/${owner}/${repo}`,
-      defaultBranch: 'main',
-    };
-  }
-}
+export * from './types';
+export * from './errors';
+export * from './client';
+export * from './auth';
+export * from './users';
+export * from './repositories';
+export * from './commits';
+export * from './pull-requests';
+export * from './reviews';
+export * from './issues';
+export * from './webhooks';
