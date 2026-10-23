@@ -262,16 +262,80 @@ Audit log and event stream of GitHub webhooks and developer activities.
 
 ---
 
-## Migrations
+## Database Setup & Workflow
 
-The initial migration is located at:
+### 1. Connection Configuration
+In local development, the PostgreSQL container maps container port `5432` to host port `5433` (as defined in `docker-compose.yml` and `.env.example`).
+
+The connection string format:
+```env
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_DB=devpulse
+POSTGRES_PORT=5433
+DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${POSTGRES_DB}
+```
+
+### 2. Migrations
+The initial schema migration is located at:
 `packages/database/prisma/migrations/20261020115431_init_github_activity_schema/migration.sql`
 
-To apply this migration in development:
+To apply pending migrations in development:
 ```bash
+# Using root command
+pnpm db:migrate:dev
+
+# Or package filter
 pnpm --filter @devpulse/database db:migrate:dev
 ```
-Or for production/deploy environments:
+
+To apply migrations in production or CI/CD pipelines:
 ```bash
+# Using root command
+pnpm db:migrate:deploy
+
+# Or package filter
 pnpm --filter @devpulse/database db:migrate:deploy
 ```
+
+### 3. Database Seeding
+An initial idempotent seed script is provided at `packages/database/prisma/seed.ts`. It provisions:
+- **Default Admin User**: `admin@devpulse.local` (`UserRole.ADMIN`)
+- **Default Workspace**: `DevPulse Organization` (`slug: devpulse-org`)
+- **Default Tracked Repository**: `DevPulse/DevPulse` (`status: ACTIVE`)
+
+Run the seeder with:
+```bash
+# Using root command
+pnpm db:seed
+
+# Or package filter
+pnpm --filter @devpulse/database db:seed
+```
+
+### 4. Prisma Studio (Visual GUI)
+To launch Prisma's visual data browser and inspect database records in your web browser:
+```bash
+# Using root command
+pnpm db:studio
+
+# Or package filter
+pnpm --filter @devpulse/database db:studio
+```
+Prisma Studio opens by default at `http://localhost:5555`.
+
+---
+
+## Database Command Reference
+
+All database commands can be executed either from the monorepo root or directly targeted at `@devpulse/database`:
+
+| Action | Root Command | Filter Command | Description |
+|---|---|---|---|
+| **Generate Client** | `pnpm db:generate` | `pnpm --filter @devpulse/database prisma:generate` | Generates the `@prisma/client` types from `schema.prisma`. |
+| **Apply Dev Migrations** | `pnpm db:migrate:dev` | `pnpm --filter @devpulse/database db:migrate:dev` | Creates and applies new migrations in dev mode. |
+| **Deploy Migrations** | `pnpm db:migrate:deploy` | `pnpm --filter @devpulse/database db:migrate:deploy` | Applies unapplied migrations in CI/CD or production. |
+| **Push Schema** | `pnpm db:push` | `pnpm --filter @devpulse/database db:push` | Pushes the schema state directly to DB without creating a migration file. |
+| **Seed Database** | `pnpm db:seed` | `pnpm --filter @devpulse/database db:seed` | Executes `prisma/seed.ts` with demo/seed records. |
+| **Prisma Studio** | `pnpm db:studio` | `pnpm --filter @devpulse/database db:studio` | Starts the Prisma Studio web interface on port 5555. |
+
