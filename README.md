@@ -110,9 +110,30 @@ DevPulse/
 
 ---
 
+## 📚 Documentation
+
+Detailed documentation is available in the [`docs/`](docs/) directory:
+
+- 🏛️ **Architecture**:
+  - [System Architecture Overview](docs/architecture/overview.md)
+  - [Architecture Decision Records (ADRs)](docs/architecture/decisions/README.md)
+- 💻 **Development**:
+  - [Local Development Setup Guide](docs/development/setup.md)
+- 🗄️ **Database**:
+  - [Database Schema & Entity Relationships](docs/database/schema.md)
+- 🐙 **GitHub Integration**:
+  - [GitHub Integration, OAuth & Webhooks Guide](docs/github/integration.md)
+- 🚀 **Deployment & Infrastructure**:
+  - [Deployment Overview](docs/deployment/overview.md)
+  - [Local Infrastructure with Docker Compose](docs/deployment/local-infrastructure.md)
+- 🛡️ **API & Error Handling**:
+  - [Global API Error Handling & Standards](docs/api/error-handling.md)
+
+---
+
 ## 🤝 Contributing
 
-Please see [CONTRIBUTING.md](file:///d:/My%20projects/DevPulse/CONTRIBUTING.md) for details on our code of conduct and development workflows.
+Please see [CONTRIBUTING.md](file:///d:/My%20projects/DevPulse/CONTRIBUTING.md) for details on our code of conduct and development workflows. Follow the [Local Development Setup Guide](docs/development/setup.md) to get started.
 
 ---
 
