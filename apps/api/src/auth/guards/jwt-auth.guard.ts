@@ -2,13 +2,13 @@ import {
   CanActivate,
   ExecutionContext,
   Injectable,
-  UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 import { AuthService } from '../auth.service';
 import { IS_PUBLIC_KEY } from '../decorators/auth.decorators';
 import { RedisService } from '../../redis.service';
+import { AuthenticationException } from '../../common/errors';
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
@@ -32,7 +32,7 @@ export class JwtAuthGuard implements CanActivate {
     const token = this.extractTokenFromHeader(request);
 
     if (!token) {
-      throw new UnauthorizedException('Authentication token missing');
+      throw new AuthenticationException('Authentication token missing');
     }
 
     const payload = this.authService.verifyAccessToken(token);
@@ -42,11 +42,11 @@ export class JwtAuthGuard implements CanActivate {
       try {
         const isBlacklisted = await this.redisService.client.get(`session:revoked:${payload.sessionId}`);
         if (isBlacklisted) {
-          throw new UnauthorizedException('Session has been revoked');
+          throw new AuthenticationException('Session has been revoked');
         }
       } catch (err) {
-        // If it's UnauthorizedException, rethrow; otherwise allow DB/JWT fallback if Redis is unreachable
-        if (err instanceof UnauthorizedException) {
+        // If it's AuthenticationException, rethrow; otherwise allow DB/JWT fallback if Redis is unreachable
+        if (err instanceof AuthenticationException) {
           throw err;
         }
       }

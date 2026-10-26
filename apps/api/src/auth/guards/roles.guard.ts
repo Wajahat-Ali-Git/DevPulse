@@ -1,12 +1,12 @@
 import {
   CanActivate,
   ExecutionContext,
-  ForbiddenException,
   Injectable,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { UserRole } from '@devpulse/types';
 import { ROLES_KEY } from '../decorators/auth.decorators';
+import { AuthorizationException } from '../../common/errors';
 
 @Injectable()
 export class RolesGuard implements CanActivate {
@@ -26,12 +26,12 @@ export class RolesGuard implements CanActivate {
     const user = request.user;
 
     if (!user || !user.role) {
-      throw new ForbiddenException('Access denied: insufficient permissions');
+      throw new AuthorizationException('Access denied: insufficient permissions');
     }
 
     const hasRole = requiredRoles.includes(user.role);
     if (!hasRole) {
-      throw new ForbiddenException(
+      throw new AuthorizationException(
         `Access denied: required role is [${requiredRoles.join(', ')}], current role is [${user.role}]`,
       );
     }

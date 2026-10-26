@@ -1,9 +1,62 @@
 import * as assert from 'node:assert';
-import { ExecutionContext, UnauthorizedException, ForbiddenException } from '@nestjs/common';
+import { ExecutionContext, HttpStatus } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
+import { ApiErrorCode } from '@devpulse/types';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard, RolesGuard } from './guards';
 import { IS_PUBLIC_KEY, ROLES_KEY } from './decorators/auth.decorators';
+import { AuthenticationException, AuthorizationException } from '../common/errors';
+import { GlobalExceptionFilter } from '../common/filters/global-exception.filter';
+
+function createMockHost(req: any = {}, res: any = {}) {
+  let statusCode = 200;
+  let responseData: any = null;
+  const headers: Record<string, string> = {};
+
+  const mockResponse = {
+    status: (code: number) => {
+      statusCode = code;
+      return mockResponse;
+    },
+    json: (data: any) => {
+      responseData = data;
+      return mockResponse;
+    },
+    setHeader: (name: string, value: string) => {
+      headers[name.toLowerCase()] = value;
+      return mockResponse;
+    },
+    getHeader: (name: string) => headers[name.toLowerCase()],
+    ...res,
+  };
+
+  const mockRequest = {
+    method: 'GET',
+    url: '/api/v1/auth/me',
+    headers: {},
+    ...req,
+  };
+
+  const host = {
+    switchToHttp: () => ({
+      getResponse: () => mockResponse,
+      getRequest: () => mockRequest,
+      getNext: () => () => {},
+    }),
+    getType: () => 'http',
+    getArgs: () => [mockRequest, mockResponse],
+    getArgByIndex: (index: number) => (index === 0 ? mockRequest : mockResponse),
+    switchToRpc: () => ({} as any),
+    switchToWs: () => ({} as any),
+  };
+
+  return {
+    host,
+    getResponseData: () => responseData,
+    getStatusCode: () => statusCode,
+    getHeaders: () => headers,
+  };
+}
 
 function createMockContext(headers: Record<string, string> = {}, handlerMetadata?: any, classMetadata?: any): ExecutionContext {
   const req: any = {
@@ -27,6 +80,7 @@ async function runTests() {
 
   const authService = new AuthService();
   const reflector = new Reflector();
+  const filter = new GlobalExceptionFilter(undefined, true);
 
   // Test 1: AuthService generates and verifies JWT access token
   console.log('Test 1: AuthService token generation and verification');
@@ -73,8 +127,8 @@ async function runTests() {
     console.log('  ✓ Public route allowed');
   }
 
-  // Test 4: JwtAuthGuard rejects missing Bearer token on private route
-  console.log('Test 4: JwtAuthGuard rejects missing token on private route');
+  // Test 4: JwtAuthGuard rejects missing Bearer token on private route with AuthenticationException
+  console.log('Test 4: JwtAuthGuard rejects unauthenticated request with consistent 401 error structure');
   {
     const privateReflector = {
       getAllAndOverride: () => undefined,
@@ -83,21 +137,35 @@ async function runTests() {
     const guard = new JwtAuthGuard(privateReflector, authService);
     const context = createMockContext({});
 
-    await assert.rejects(
-      async () => {
-        await guard.canActivate(context);
+    let caughtError: any;
+    try {
+      await guard.canActivate(context);
+    } catch (err) {
+      caughtError = err;
+    }
+
+    assert.ok(caughtError instanceof AuthenticationException);
+    assert.strictEqual(caughtError.message, 'Authentication token missing');
+    assert.strictEqual(caughtError.code, ApiErrorCode.UNAUTHORIZED);
+
+    // Verify response shape through GlobalExceptionFilter
+    const mock = createMockHost({ headers: { 'x-request-id': 'req_unauth_test' } });
+    filter.catch(caughtError, mock.host as any);
+
+    assert.strictEqual(mock.getStatusCode(), HttpStatus.UNAUTHORIZED);
+    assert.deepStrictEqual(mock.getResponseData(), {
+      success: false,
+      error: {
+        code: ApiErrorCode.UNAUTHORIZED,
+        message: 'Authentication token missing',
       },
-      (err: any) => {
-        assert.ok(err instanceof UnauthorizedException);
-        assert.strictEqual(err.message, 'Authentication token missing');
-        return true;
-      },
-    );
-    console.log('  ✓ Missing token rejected with 401 Unauthorized');
+      requestId: 'req_unauth_test',
+    });
+    console.log('  ✓ Unauthenticated request rejected with canonical 401 response payload');
   }
 
   // Test 5: JwtAuthGuard verifies valid Bearer token and attaches user to request
-  console.log('Test 5: JwtAuthGuard attaches user payload for valid token');
+  console.log('Test 5: JwtAuthGuard authorizes authenticated request with valid JWT');
   {
     const privateReflector = {
       getAllAndOverride: () => undefined,
@@ -121,11 +189,11 @@ async function runTests() {
     assert.strictEqual(req.user.sub, 'usr_dev_456');
     assert.strictEqual(req.user.email, 'lead@devpulse.local');
     assert.strictEqual(req.user.role, 'MEMBER');
-    console.log('  ✓ User authenticated and attached to request context');
+    console.log('  ✓ Authenticated request passes and context has user info');
   }
 
   // Test 6: RolesGuard allows authorized role
-  console.log('Test 6: RolesGuard allows matching role');
+  console.log('Test 6: RolesGuard allows matching role for authenticated request');
   {
     const rolesReflector = {
       getAllAndOverride: (key: string) => (key === ROLES_KEY ? ['ADMIN'] : undefined),
@@ -141,8 +209,8 @@ async function runTests() {
     console.log('  ✓ ADMIN role successfully allowed');
   }
 
-  // Test 7: RolesGuard denies unauthorized role
-  console.log('Test 7: RolesGuard denies insufficient role');
+  // Test 7: RolesGuard denies unauthorized role with AuthorizationException
+  console.log('Test 7: RolesGuard rejects forbidden role with canonical 403 error structure');
   {
     const rolesReflector = {
       getAllAndOverride: (key: string) => (key === ROLES_KEY ? ['ADMIN'] : undefined),
@@ -153,17 +221,31 @@ async function runTests() {
     const req = context.switchToHttp().getRequest();
     req.user = { sub: 'usr_viewer', email: 'viewer@devpulse.local', role: 'VIEWER' };
 
-    assert.throws(
-      () => {
-        rolesGuard.canActivate(context);
+    let caughtError: any;
+    try {
+      rolesGuard.canActivate(context);
+    } catch (err) {
+      caughtError = err;
+    }
+
+    assert.ok(caughtError instanceof AuthorizationException);
+    assert.strictEqual(caughtError.code, ApiErrorCode.FORBIDDEN);
+    assert.ok(caughtError.message.includes('required role is [ADMIN], current role is [VIEWER]'));
+
+    // Verify response shape through GlobalExceptionFilter
+    const mock = createMockHost({ headers: { 'x-request-id': 'req_forbid_test' } });
+    filter.catch(caughtError, mock.host as any);
+
+    assert.strictEqual(mock.getStatusCode(), HttpStatus.FORBIDDEN);
+    assert.deepStrictEqual(mock.getResponseData(), {
+      success: false,
+      error: {
+        code: ApiErrorCode.FORBIDDEN,
+        message: 'Access denied: required role is [ADMIN], current role is [VIEWER]',
       },
-      (err: any) => {
-        assert.ok(err instanceof ForbiddenException);
-        assert.ok(err.message.includes('required role is [ADMIN], current role is [VIEWER]'));
-        return true;
-      },
-    );
-    console.log('  ✓ Non-admin role rejected with 403 Forbidden');
+      requestId: 'req_forbid_test',
+    });
+    console.log('  ✓ Forbidden request rejected with canonical 403 response payload');
   }
 
   console.log('\n✅ ALL AUTHENTICATION & GUARD TESTS PASSED!');
@@ -173,3 +255,4 @@ runTests().catch((err) => {
   console.error('❌ Auth tests failed:', err);
   process.exit(1);
 });
+

@@ -267,7 +267,82 @@ If all dependencies are reachable, it returns `HTTP 200`. If any dependency is u
 
 ---
 
-## 9. Development Commands Reference
+## 9. Local Authentication Setup & Testing
+
+DevPulse secures private endpoints using JWT Bearer tokens and role-based access control (`ADMIN`, `MEMBER`, `VIEWER`).
+
+### 9.1 Environment Variables
+Confirm these variables are configured in `.env`:
+```env
+JWT_SECRET=devpulse_super_secret_jwt_key_32bytes!
+JWT_EXPIRES_IN=15m
+SESSION_SECRET=devpulse_super_secret_session_key_32bytes!
+GITHUB_CLIENT_ID=dev_github_client_id
+GITHUB_CLIENT_SECRET=dev_github_client_secret
+GITHUB_CALLBACK_URL=http://localhost:3000/api/v1/auth/github/callback
+```
+
+### 9.2 Generating Dev Tokens for Local Testing
+During local development, you can generate a test Bearer token using Node.js or the initial seeded administrator (`admin@devpulse.local`):
+
+```bash
+# In Node.js terminal or REPL:
+node -e "const jwt = require('jsonwebtoken'); console.log(jwt.sign({ sub: 'admin-uuid', email: 'admin@devpulse.local', role: 'ADMIN' }, 'devpulse_super_secret_jwt_key_32bytes!', { expiresIn: '1d' }));"
+```
+
+### 9.3 Testing Authenticated vs Unauthenticated Endpoints
+
+#### Unauthenticated Request (Fails with 401)
+Accessing protected route without `Authorization` header:
+```bash
+curl -i http://localhost:3000/api/v1/auth/me
+```
+Expected response:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Authentication token missing"
+  },
+  "requestId": "e1f13b5d-222a-4bc3-9584-601445ec640f"
+}
+```
+
+#### Authenticated Request (Succeeds)
+Providing valid Bearer token in request header:
+```bash
+curl -i -H "Authorization: Bearer <YOUR_ACCESS_TOKEN>" http://localhost:3000/api/v1/auth/me
+```
+
+#### Unauthorized Role Request (Fails with 403)
+Accessing admin-protected diagnostic route with insufficient role (e.g. `VIEWER`):
+```bash
+curl -i -H "Authorization: Bearer <VIEWER_TOKEN>" http://localhost:3000/api/v1/health/db
+```
+Expected response:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Access denied: required role is [ADMIN], current role is [VIEWER]"
+  },
+  "requestId": "2e7428fb-2ff8-46aa-b2b9-e137a89f9293"
+}
+```
+
+#### Public Routes (No Auth Needed)
+Public probes remain open for container health checks and proxies:
+```bash
+curl -i http://localhost:3000/api/v1/health
+curl -i http://localhost:3000/api/v1/health/live
+curl -i http://localhost:3000/api/v1/health/ready
+```
+
+---
+
+## 10. Development Commands Reference
 
 | Command | Action |
 |---|---|

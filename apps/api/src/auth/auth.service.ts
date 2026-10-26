@@ -1,8 +1,9 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import * as jwt from 'jsonwebtoken';
 import { config } from '@devpulse/config';
 import { AuthTokenPayload, AuthTokens, UserRole } from '@devpulse/types';
 import * as crypto from 'crypto';
+import { AuthenticationException } from '../common/errors';
 
 @Injectable()
 export class AuthService {
@@ -27,9 +28,9 @@ export class AuthService {
       return decoded;
     } catch (err: any) {
       if (err instanceof jwt.TokenExpiredError) {
-        throw new UnauthorizedException('Access token has expired');
+        throw new AuthenticationException('Access token has expired');
       }
-      throw new UnauthorizedException('Invalid access token');
+      throw new AuthenticationException('Invalid access token');
     }
   }
 

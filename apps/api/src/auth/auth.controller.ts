@@ -3,12 +3,12 @@ import {
   Get,
   Post,
   Body,
-  UnauthorizedException,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { DatabaseService } from '../database.service';
 import { Public, CurrentUser } from './decorators';
 import { AuthTokenPayload } from '@devpulse/types';
+import { AuthenticationException } from '../common/errors';
 
 export class RefreshDto {
   refreshToken!: string;
@@ -41,7 +41,7 @@ export class AuthController {
     });
 
     if (!userRecord) {
-      throw new UnauthorizedException('User not found');
+      throw new AuthenticationException('User not found');
     }
 
     return userRecord;
@@ -55,7 +55,7 @@ export class AuthController {
   @Post('refresh')
   async refreshTokens(@Body() body: RefreshDto) {
     if (!body?.refreshToken) {
-      throw new UnauthorizedException('Refresh token is required');
+      throw new AuthenticationException('Refresh token is required');
     }
 
     const tokenHash = this.authService.hashToken(body.refreshToken);
@@ -66,7 +66,7 @@ export class AuthController {
     });
 
     if (!existingToken) {
-      throw new UnauthorizedException('Invalid refresh token');
+      throw new AuthenticationException('Invalid refresh token');
     }
 
     // Replay attack detection: if token is already revoked, revoke all tokens in family
@@ -75,12 +75,12 @@ export class AuthController {
         where: { familyId: existingToken.familyId },
         data: { isRevoked: true, revokedAt: new Date() },
       });
-      throw new UnauthorizedException('Refresh token reuse detected. Session terminated.');
+      throw new AuthenticationException('Refresh token reuse detected. Session terminated.');
     }
 
     // Check expiration
     if (new Date() > existingToken.expiresAt) {
-      throw new UnauthorizedException('Refresh token expired');
+      throw new AuthenticationException('Refresh token expired');
     }
 
     // Mark current token as revoked
