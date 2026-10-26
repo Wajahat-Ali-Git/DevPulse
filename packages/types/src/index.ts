@@ -1,10 +1,55 @@
+export type UserRole = 'ADMIN' | 'MEMBER' | 'VIEWER';
+
 export interface User {
   id: string;
   email: string;
   name: string;
+  role: UserRole;
+  avatarUrl?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
+
+export interface Session {
+  id: string;
+  userId: string;
+  sessionToken: string;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  expiresAt: Date;
+  lastActiveAt: Date;
+  revokedAt?: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface RefreshToken {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  familyId: string;
+  isRevoked: boolean;
+  revokedAt?: Date | null;
+  expiresAt: Date;
+  createdAt: Date;
+}
+
+export interface AuthTokenPayload {
+  sub: string;
+  email: string;
+  role: UserRole;
+  sessionId?: string;
+  iat?: number;
+  exp?: number;
+}
+
+export interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+  tokenType: 'Bearer';
+  expiresIn: number;
+}
+
 
 export interface Repository {
   id: string;

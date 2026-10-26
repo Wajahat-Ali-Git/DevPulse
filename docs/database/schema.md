@@ -12,6 +12,8 @@ The database is built on **PostgreSQL** and managed using **Prisma ORM** (`packa
 
 ```mermaid
 erDiagram
+    users ||--o{ sessions : "owns"
+    users ||--o{ refresh_tokens : "issued"
     users ||--o{ workspace_members : "belongs to"
     workspaces ||--o{ workspace_members : "contains"
     users ||--o{ github_accounts : "links"
@@ -37,6 +39,30 @@ erDiagram
         string avatar_url
         datetime created_at
         datetime updated_at
+    }
+
+    sessions {
+        string id PK
+        string user_id FK
+        string session_token UK
+        string ip_address
+        string user_agent
+        datetime expires_at
+        datetime last_active_at
+        datetime revoked_at
+        datetime created_at
+        datetime updated_at
+    }
+
+    refresh_tokens {
+        string id PK
+        string user_id FK
+        string token_hash UK
+        string family_id
+        boolean is_revoked
+        datetime revoked_at
+        datetime expires_at
+        datetime created_at
     }
 
     workspaces {
@@ -176,12 +202,33 @@ Represents application users (developers, team leads, administrators).
 - **Relations**:
   - `memberships`: One-to-many with `workspace_members` (on delete cascade)
   - `githubAccounts`: One-to-many with `github_accounts` (on delete cascade)
+  - `sessions`: One-to-many with `sessions` (on delete cascade)
+  - `refreshTokens`: One-to-many with `refresh_tokens` (on delete cascade)
   - `authoredCommits`: One-to-many with `commits` (on delete set null)
   - `pullRequests`: One-to-many with `pull_requests` (on delete set null)
   - `reviews`: One-to-many with `reviews` (on delete set null)
   - `activityEvents`: One-to-many with `activity_events` (on delete set null)
 
-### 2. `github_accounts`
+### 2. `sessions`
+Device/browser sessions for authenticated user presence, audit, and rapid remote logout.
+- **Primary Key**: `id` (UUID)
+- **Unique Constraints**: `session_token`
+- **Foreign Keys**: `user_id` -> `users(id)` (ON DELETE CASCADE)
+- **Indexes**:
+  - `sessions_user_id_idx` (`user_id`)
+  - `sessions_expires_at_idx` (`expires_at`)
+
+### 3. `refresh_tokens`
+Hashed refresh tokens supporting rotation, family grouping, and reuse/replay detection.
+- **Primary Key**: `id` (UUID)
+- **Unique Constraints**: `token_hash`
+- **Foreign Keys**: `user_id` -> `users(id)` (ON DELETE CASCADE)
+- **Indexes**:
+  - `refresh_tokens_user_id_idx` (`user_id`)
+  - `refresh_tokens_family_id_idx` (`family_id`)
+  - `refresh_tokens_expires_at_idx` (`expires_at`)
+
+### 4. `github_accounts`
 OAuth-linked GitHub user profiles for authentication and API tokens.
 - **Primary Key**: `id` (UUID)
 - **Unique Constraints**: `github_user_id` (BigInt)
