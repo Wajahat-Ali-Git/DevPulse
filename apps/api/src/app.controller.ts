@@ -2,6 +2,7 @@ import { Controller, Get } from '@nestjs/common';
 import { AppService } from './app.service';
 import { DatabaseService } from './database.service';
 import { RedisService } from './redis.service';
+import { Public, Roles } from './auth';
 
 @Controller()
 export class AppController {
@@ -11,11 +12,13 @@ export class AppController {
     private readonly redisService: RedisService,
   ) {}
 
+  @Public()
   @Get()
   getHello(): { message: string; timestamp: string } {
     return this.appService.getHello();
   }
 
+  @Roles('ADMIN')
   @Get('health/db')
   async getDatabaseHealth() {
     const health = await this.databaseService.checkHealth();
@@ -26,6 +29,7 @@ export class AppController {
     };
   }
 
+  @Roles('ADMIN')
   @Get('health/redis')
   async getRedisHealth() {
     const health = await this.redisService.checkHealth();
