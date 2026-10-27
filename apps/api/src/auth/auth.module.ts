@@ -1,7 +1,8 @@
 import { Module } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
-import { JwtAuthGuard, RolesGuard } from './guards';
+import { JwtAuthGuard, RolesGuard, GitHubOAuthGuard } from './guards';
+import { GitHubOAuthService } from './github-oauth.service';
 import { DatabaseService } from '../database.service';
 import { RedisService } from '../redis.service';
 
@@ -9,11 +10,13 @@ import { RedisService } from '../redis.service';
   controllers: [AuthController],
   providers: [
     AuthService,
+    GitHubOAuthService,
     DatabaseService,
     RedisService,
     JwtAuthGuard,
     RolesGuard,
+    GitHubOAuthGuard,
   ],
-  exports: [AuthService, JwtAuthGuard, RolesGuard],
+  exports: [AuthService, GitHubOAuthService, JwtAuthGuard, RolesGuard],
 })
 export class AuthModule {}
