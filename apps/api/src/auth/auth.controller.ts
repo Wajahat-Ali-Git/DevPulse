@@ -3,26 +3,169 @@ import {
   Get,
   Post,
   Body,
+  Query,
+  Res,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { AuthService } from './auth.service';
+import { GitHubOAuthService } from './github-oauth.service';
 import { DatabaseService } from '../database.service';
 import { Public, CurrentUser } from './decorators';
+import { GitHubOAuthGuard } from './guards';
 import { AuthTokenPayload } from '@devpulse/types';
 import { AuthenticationException } from '../common/errors';
+import { config } from '@devpulse/config';
 
 export class RefreshDto {
   refreshToken!: string;
+}
+
+export class AssociateGitHubDto {
+  code!: string;
+  state!: string;
 }
 
 @Controller('auth')
 export class AuthController {
   constructor(
     private readonly authService: AuthService,
+    private readonly githubOAuthService: GitHubOAuthService,
     private readonly databaseService: DatabaseService,
   ) {}
 
+  // ---------------------------------------------------------------------------
+  // GitHub OAuth — Authorization
+  // ---------------------------------------------------------------------------
+
   /**
-   * Returns current authenticated user profile.
+   * Initiates the GitHub OAuth flow.
+   * Generates a CSRF state token and redirects the browser to GitHub's
+   * authorization page.
+   * If an authenticated user token is present, associates state with user.sub.
+   *
+   * GET /api/v1/auth/github
+   */
+  @Public()
+  @Get('github')
+  async githubAuthorize(
+    @CurrentUser() currentUser: AuthTokenPayload | undefined,
+    @Res() res: Response,
+  ): Promise<void> {
+    const authorizationUrl = await this.githubOAuthService.buildAuthorizationUrl(
+      currentUser?.sub,
+    );
+    res.redirect(authorizationUrl);
+  }
+
+  /**
+   * Initiates the GitHub OAuth flow specifically for linking the GitHub identity
+   * to the currently authenticated DevPulse user.
+   * Protected route.
+   *
+   * GET /api/v1/auth/github/connect
+   */
+  @Get('github/connect')
+  async githubConnect(
+    @CurrentUser() user: AuthTokenPayload,
+    @Res() res: Response,
+  ): Promise<void> {
+    const authorizationUrl = await this.githubOAuthService.buildAuthorizationUrl(user.sub);
+    res.redirect(authorizationUrl);
+  }
+
+  /**
+   * Directly associates a GitHub authorization code and state with the
+   * currently authenticated DevPulse user.
+   * Protected route.
+   *
+   * POST /api/v1/auth/github/associate
+   */
+  @Post('github/associate')
+  @HttpCode(HttpStatus.OK)
+  async associateGitHub(
+    @CurrentUser() user: AuthTokenPayload,
+    @Body() body: AssociateGitHubDto,
+  ) {
+    if (!body?.code || !body?.state) {
+      throw new AuthenticationException(
+        'Code and state parameters are required to associate GitHub identity',
+      );
+    }
+
+    const result = await this.githubOAuthService.associateGitHubIdentity(
+      user.sub,
+      body.code,
+      body.state,
+    );
+
+    return {
+      message: 'GitHub identity successfully associated with user',
+      user: result.user,
+      githubAccount: {
+        id: result.gitHubAccount.id,
+        githubUserId: result.gitHubAccount.githubUserId.toString(),
+        username: result.gitHubAccount.username,
+        displayName: result.gitHubAccount.displayName,
+        email: result.gitHubAccount.email,
+        avatarUrl: result.gitHubAccount.avatarUrl,
+        profileUrl: result.gitHubAccount.profileUrl,
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // GitHub OAuth — Callback
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Handles the GitHub OAuth callback.
+   * Validates the CSRF state, exchanges the authorization code for an access
+   * token, associates or upserts the user record and linked GitHubAccount,
+   * then issues a DevPulse JWT pair.
+   *
+   * On success, redirects to the web application with tokens as query params.
+   *
+   * GET /api/v1/auth/github/callback
+   */
+  @Public()
+  @UseGuards(GitHubOAuthGuard)
+  @Get('github/callback')
+  async githubCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @CurrentUser() currentUser: AuthTokenPayload | undefined,
+    @Res() res: Response,
+  ): Promise<void> {
+    const { tokens, isNewUser, isLinked } = await this.githubOAuthService.handleCallback(
+      code,
+      state,
+      currentUser?.sub,
+    );
+
+    // Redirect to the web app carrying the token pair as query params.
+    const webUrl = config.urls.web;
+    const redirectUrl = new URL('/auth/callback', webUrl);
+    redirectUrl.searchParams.set('access_token', tokens.accessToken);
+    redirectUrl.searchParams.set('refresh_token', tokens.refreshToken);
+    redirectUrl.searchParams.set('token_type', tokens.tokenType);
+    redirectUrl.searchParams.set('expires_in', String(tokens.expiresIn));
+    redirectUrl.searchParams.set('is_new_user', String(isNewUser));
+    if (isLinked) {
+      redirectUrl.searchParams.set('is_linked', 'true');
+    }
+
+    res.redirect(redirectUrl.toString());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Current User Profile
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns current authenticated user profile, including linked GitHub accounts.
    * Protected route.
    */
   @Get('me')
@@ -37,6 +180,19 @@ export class AuthController {
         avatarUrl: true,
         createdAt: true,
         updatedAt: true,
+        githubAccounts: {
+          select: {
+            id: true,
+            githubUserId: true,
+            username: true,
+            displayName: true,
+            email: true,
+            avatarUrl: true,
+            profileUrl: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
       },
     });
 
@@ -44,8 +200,18 @@ export class AuthController {
       throw new AuthenticationException('User not found');
     }
 
-    return userRecord;
+    return {
+      ...userRecord,
+      githubAccounts: userRecord.githubAccounts.map((gh) => ({
+        ...gh,
+        githubUserId: gh.githubUserId.toString(),
+      })),
+    };
   }
+
+  // ---------------------------------------------------------------------------
+  // Token Refresh
+  // ---------------------------------------------------------------------------
 
   /**
    * Refreshes JWT access token using opaque refresh token with rotation.
