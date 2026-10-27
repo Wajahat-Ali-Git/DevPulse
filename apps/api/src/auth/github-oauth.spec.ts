@@ -16,8 +16,9 @@
 import * as assert from 'node:assert';
 import { ExecutionContext } from '@nestjs/common';
 import { GitHubOAuthGuard } from './guards/github-oauth.guard';
-import { GitHubOAuthService } from './github-oauth.service';
+import { GitHubOAuthService, GITHUB_OAUTH_SCOPES } from './github-oauth.service';
 import { AuthService } from './auth.service';
+import { AuthController } from './auth.controller';
 import { AuthenticationException, ConflictException } from '../common/errors';
 
 // ---------------------------------------------------------------------------
@@ -602,7 +603,334 @@ async function testIdentityAssociation() {
 
     assert.ok(caught instanceof AuthenticationException);
     assert.ok(caught.message.includes('does not match the authenticated user session'));
-    console.log('  ✓ associateGitHubIdentity rejects mismatched user state');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Minimum Permissions & Callback Scenarios (Success, Denial, Invalid)
+// ---------------------------------------------------------------------------
+
+async function testCallbackScenarios() {
+  console.log('\n--- Minimum Permissions & End-to-End Callback Scenarios ---');
+
+  const authService = new AuthService();
+
+  // 23. Minimum required scopes requested
+  {
+    assert.deepStrictEqual([...GITHUB_OAUTH_SCOPES], ['read:user', 'user:email']);
+    assert.ok(!GITHUB_OAUTH_SCOPES.includes('repo'), 'Should NOT request broad "repo" scope for basic authentication');
+    assert.ok(!GITHUB_OAUTH_SCOPES.includes('admin'), 'Should NOT request admin scopes');
+    assert.ok(!GITHUB_OAUTH_SCOPES.includes('write'), 'Should NOT request write scopes');
+
+    const svc = new GitHubOAuthService(
+      authService,
+      makeDbServiceMock() as any,
+      makeRedisServiceMock(makeRedisMock()) as any,
+    );
+    let capturedOptions: any = null;
+    (svc as any).githubAuthApi = {
+      getAuthorizationUrl: (options: any) => {
+        capturedOptions = options;
+        return `https://github.com/login/oauth/authorize?scope=${options.scopes.join('+')}&state=${options.state}`;
+      },
+    };
+
+    const url = await svc.buildAuthorizationUrl();
+    assert.deepStrictEqual(capturedOptions.scopes, ['read:user', 'user:email']);
+    assert.ok(url.includes('scope=read%3Auser+user%3Aemail') || url.includes('read:user'));
+    console.log('  ✓ Minimum required scopes requested strictly (read:user, user:email)');
+  }
+
+  // 24. Callback Success Scenario (New user signs in via OAuth)
+  {
+    const state = 'c'.repeat(48);
+    const redis = makeRedisMock({ getdel: async () => '1' });
+    let createdUser: any = null;
+    let createdAccount: any = null;
+    let createdRefreshToken: any = null;
+
+    const dbMock = makeDbServiceMock({
+      user: {
+        findUnique: async () => null,
+      },
+      gitHubAccount: {
+        findUnique: async () => null,
+      },
+      $transaction: async (fn: any) => {
+        return fn({
+          user: {
+            create: async (args: any) => {
+              createdUser = { id: 'usr_brand_new', ...args.data };
+              return createdUser;
+            },
+          },
+          gitHubAccount: {
+            create: async (args: any) => {
+              createdAccount = { id: 'gh_brand_new', ...args.data };
+              return createdAccount;
+            },
+          },
+        });
+      },
+      refreshToken: {
+        create: async (args: any) => {
+          createdRefreshToken = args.data;
+          return { id: 'rt_1', ...args.data };
+        },
+      },
+    });
+
+    const svc = new GitHubOAuthService(
+      authService,
+      dbMock as any,
+      makeRedisServiceMock(redis) as any,
+    );
+
+    (svc as any).githubAuthApi = {
+      exchangeCodeForToken: async () => ({
+        access_token: 'gho_fresh_tok',
+        refresh_token: 'ghr_fresh_tok',
+        expires_in: 3600,
+        scope: 'read:user,user:email',
+      }),
+    };
+    (svc as any).fetchGitHubProfile = async () => ({
+      githubUser: {
+        id: 998877,
+        login: 'newcoder',
+        name: 'New Coder',
+        email: null,
+        avatar_url: 'https://github.com/avatar.png',
+        html_url: 'https://github.com/newcoder',
+      },
+      primaryEmail: 'verified.new@example.com',
+    });
+
+    const result = await svc.handleCallback('valid_auth_code', state);
+
+    assert.strictEqual(result.isNewUser, true);
+    assert.strictEqual(result.isLinked, false);
+    assert.ok(result.tokens.accessToken, 'Access token should be issued');
+    assert.ok(result.tokens.refreshToken, 'Refresh token should be issued');
+    assert.strictEqual(createdUser.email, 'verified.new@example.com');
+    assert.strictEqual(createdAccount.username, 'newcoder');
+    assert.deepStrictEqual(createdAccount.scopes, ['read:user', 'user:email']);
+    assert.strictEqual(createdRefreshToken.userId, 'usr_brand_new');
+    console.log('  ✓ Callback success scenario: creates user, creates account with minimal scopes, issues tokens');
+  }
+
+  // 25. Callback Success Scenario with Controller Redirect
+  {
+    const state = 'd'.repeat(48);
+    const redis = makeRedisMock({ getdel: async () => '1' });
+
+    const dbMock = makeDbServiceMock({
+      user: {
+        findUnique: async () => ({ id: 'usr_existing', email: 'existing@devpulse.io', role: 'MEMBER' }),
+      },
+      gitHubAccount: {
+        findUnique: async () => ({
+          id: 'gh_existing',
+          userId: 'usr_existing',
+          user: { id: 'usr_existing', email: 'existing@devpulse.io', role: 'MEMBER' },
+        }),
+        update: async () => ({ id: 'gh_existing' }),
+      },
+    });
+
+    const svc = new GitHubOAuthService(
+      authService,
+      dbMock as any,
+      makeRedisServiceMock(redis) as any,
+    );
+
+    (svc as any).githubAuthApi = {
+      exchangeCodeForToken: async () => ({
+        access_token: 'gho_tok',
+        scope: 'read:user,user:email',
+      }),
+    };
+    (svc as any).fetchGitHubProfile = async () => ({
+      githubUser: {
+        id: 112233,
+        login: 'existinguser',
+        email: 'existing@devpulse.io',
+      },
+      primaryEmail: 'existing@devpulse.io',
+    });
+
+    const controller = new AuthController(authService, svc, dbMock as any);
+    let redirectedUrl: string = '';
+    const resMock = {
+      redirect: (url: string) => {
+        redirectedUrl = url;
+      },
+    };
+
+    await controller.githubCallback('auth_code_123', state, undefined, resMock as any);
+
+    assert.ok(redirectedUrl.includes('/auth/callback'), 'Should redirect to web /auth/callback');
+    assert.ok(redirectedUrl.includes('access_token='), 'Redirect URL should include access_token');
+    assert.ok(redirectedUrl.includes('refresh_token='), 'Redirect URL should include refresh_token');
+    assert.ok(redirectedUrl.includes('is_new_user=false'), 'Existing user is_new_user should be false');
+    console.log('  ✓ Controller callback success: redirects to web app with JWTs and query params');
+  }
+
+  // 26. Callback Denial Scenario: access_denied query from GitHub
+  {
+    const guard = new GitHubOAuthGuard();
+    const ctx = makeContext({
+      error: 'access_denied',
+      error_description: 'The+user+has+denied+your+application+access.',
+    });
+
+    let guardError: any;
+    try {
+      guard.canActivate(ctx);
+    } catch (err) {
+      guardError = err;
+    }
+
+    assert.ok(guardError instanceof AuthenticationException);
+    assert.ok(guardError.message.toLowerCase().includes('denied'), `Expected denied message, got: ${guardError.message}`);
+    console.log('  ✓ Callback denial scenario: access_denied caught and reported cleanly before code exchange');
+  }
+
+  // 27. Callback Denial Scenario: application_suspended query from GitHub
+  {
+    const guard = new GitHubOAuthGuard();
+    const ctx = makeContext({
+      error: 'application_suspended',
+      error_description: 'Application+is+suspended.',
+    });
+
+    let guardError: any;
+    try {
+      guard.canActivate(ctx);
+    } catch (err) {
+      guardError = err;
+    }
+
+    assert.ok(guardError instanceof AuthenticationException);
+    assert.ok(guardError.message.toLowerCase().includes('suspended'), `Expected suspended message, got: ${guardError.message}`);
+    console.log('  ✓ Callback denial scenario: application_suspended caught with helpful message');
+  }
+
+  // 28. Invalid Callback Scenario: Missing or Empty Code
+  {
+    const guard = new GitHubOAuthGuard();
+    for (const invalidCode of [undefined, '', '   ']) {
+      const ctx = makeContext({ code: invalidCode, state: 'e'.repeat(48) });
+      let err: any;
+      try { guard.canActivate(ctx); } catch (e) { err = e; }
+      assert.ok(err instanceof AuthenticationException);
+      assert.ok(err.message.includes('authorization code'));
+    }
+    console.log('  ✓ Invalid callback scenario: missing or whitespace code rejected');
+  }
+
+  // 29. Invalid Callback Scenario: Missing or Tampered State
+  {
+    const guard = new GitHubOAuthGuard();
+    const tamperedStates = [
+      undefined,
+      '',
+      'abc',
+      '12345',
+      'e'.repeat(47), // 47 chars (1 char too short)
+      'e'.repeat(49), // 49 chars (1 char too long)
+      'e'.repeat(47) + 'Z', // Invalid hex character
+      '../etc/passwd',
+      '<script>alert(1)</script>',
+    ];
+
+    for (const badState of tamperedStates) {
+      const ctx = makeContext({ code: 'valid_code', state: badState });
+      let err: any;
+      try { guard.canActivate(ctx); } catch (e) { err = e; }
+      assert.ok(err instanceof AuthenticationException, `Failed to reject state: ${badState}`);
+    }
+    console.log('  ✓ Invalid callback scenario: missing, malformed, non-hex, and injected states rejected by guard');
+  }
+
+  // 30. Invalid Callback Scenario: State replay or expiration (Redis returns null)
+  {
+    const redis = makeRedisMock({ getdel: async () => null });
+    const svc = new GitHubOAuthService(
+      authService,
+      makeDbServiceMock() as any,
+      makeRedisServiceMock(redis) as any,
+    );
+
+    let err: any;
+    try {
+      await svc.handleCallback('any_code', 'f'.repeat(48));
+    } catch (e) {
+      err = e;
+    }
+
+    assert.ok(err instanceof AuthenticationException);
+    assert.ok(err.message.toLowerCase().includes('invalid') || err.message.toLowerCase().includes('expired'));
+    console.log('  ✓ Invalid callback scenario: state replay or expiration rejected with CSRF error');
+  }
+
+  // 31. Invalid Callback Scenario: GitHub returns bad_verification_code
+  {
+    const redis = makeRedisMock({ getdel: async () => '1' });
+    const svc = new GitHubOAuthService(
+      authService,
+      makeDbServiceMock() as any,
+      makeRedisServiceMock(redis) as any,
+    );
+
+    (svc as any).githubAuthApi = {
+      exchangeCodeForToken: async () => {
+        throw new Error('GitHub OAuth error: bad_verification_code');
+      },
+    };
+
+    let err: any;
+    try {
+      await svc.handleCallback('invalid_or_expired_code', 'a'.repeat(48));
+    } catch (e) {
+      err = e;
+    }
+
+    assert.ok(err instanceof AuthenticationException);
+    assert.ok(err.message.includes('expired or has already been used'));
+    console.log('  ✓ Invalid callback scenario: bad_verification_code mapped to friendly expired/used error');
+  }
+
+  // 32. Invalid Callback Scenario: GitHub user has no verified email
+  {
+    const redis = makeRedisMock({ getdel: async () => '1' });
+    const svc = new GitHubOAuthService(
+      authService,
+      makeDbServiceMock() as any,
+      makeRedisServiceMock(redis) as any,
+    );
+
+    (svc as any).githubAuthApi = {
+      exchangeCodeForToken: async () => ({
+        access_token: 'gho_tok',
+      }),
+    };
+    (svc as any).fetchGitHubProfile = async () => {
+      throw new AuthenticationException(
+        'Your GitHub account has no verified primary email address. Please add and verify an email on GitHub, then try signing in again.',
+      );
+    };
+
+    let err: any;
+    try {
+      await svc.handleCallback('code', 'a'.repeat(48));
+    } catch (e) {
+      err = e;
+    }
+
+    assert.ok(err instanceof AuthenticationException);
+    assert.ok(err.message.includes('verified primary email'));
+    console.log('  ✓ Invalid callback scenario: unverified email rejected with actionable message');
   }
 }
 
@@ -617,6 +945,7 @@ async function runAll() {
   await testStateValidation();
   await testCallbackErrorMapping();
   await testIdentityAssociation();
+  await testCallbackScenarios();
 
   console.log('\n✅ ALL GITHUB OAUTH & IDENTITY ASSOCIATION TESTS PASSED!\n');
 }

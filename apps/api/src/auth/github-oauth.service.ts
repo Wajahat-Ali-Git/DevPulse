@@ -22,6 +22,16 @@ const OAUTH_STATE_TTL_SECONDS = 300;
 const REFRESH_TOKEN_TTL_DAYS = 7;
 
 /**
+ * Minimal required OAuth permissions:
+ * - 'read:user': Read basic public profile (username, name, avatar, profile URL)
+ * - 'user:email': Read primary verified email for account resolution and authentication
+ *
+ * Broad repository or write scopes (e.g., 'repo', 'workflow', 'admin') are intentionally
+ * omitted to adhere strictly to the principle of least privilege.
+ */
+export const GITHUB_OAUTH_SCOPES: readonly string[] = ['read:user', 'user:email'];
+
+/**
  * GitHub error codes returned in the token exchange response body.
  * Maps raw GitHub error codes to user-facing messages.
  */
@@ -177,7 +187,7 @@ export class GitHubOAuthService {
     const state = await this.generateOAuthState(userId);
 
     return this.githubAuthApi.getAuthorizationUrl({
-      scopes: ['read:user', 'user:email'],
+      scopes: [...GITHUB_OAUTH_SCOPES],
       state,
     });
   }
@@ -306,7 +316,7 @@ export class GitHubOAuthService {
       accessToken: tokenResponse.access_token,
       refreshToken: tokenResponse.refresh_token ?? null,
       tokenExpiresAt,
-      scopes: ['read:user', 'user:email'],
+      scopes: [...GITHUB_OAUTH_SCOPES],
     };
 
     const existingAccount = await db.gitHubAccount.findUnique({
@@ -535,7 +545,7 @@ export class GitHubOAuthService {
       accessToken: tokenResponse.access_token,
       refreshToken: tokenResponse.refresh_token ?? null,
       tokenExpiresAt,
-      scopes: ['read:user', 'user:email'],
+      scopes: [...GITHUB_OAUTH_SCOPES],
     };
 
     // ── Case 1: Known GitHub account ─────────────────────────────────────────
