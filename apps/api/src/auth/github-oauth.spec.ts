@@ -1,4 +1,4 @@
-/**
+﻿/**
  * GitHub OAuth Security & Identity Association Tests
  *
  * Covers:
@@ -769,19 +769,35 @@ async function testCallbackScenarios() {
 
     const controller = new AuthController(authService, svc, dbMock as any);
     let redirectedUrl: string = '';
+    const cookiesSet: Array<{ name: string; val: string; options: any }> = [];
     const resMock = {
       redirect: (url: string) => {
         redirectedUrl = url;
+      },
+      cookie: (name: string, val: string, options: any) => {
+        cookiesSet.push({ name, val, options });
       },
     };
 
     await controller.githubCallback('auth_code_123', state, undefined, resMock as any);
 
+    // Tokens must NEVER appear in the redirect URL (browser history, server logs, Referer leak)
     assert.ok(redirectedUrl.includes('/auth/callback'), 'Should redirect to web /auth/callback');
-    assert.ok(redirectedUrl.includes('access_token='), 'Redirect URL should include access_token');
-    assert.ok(redirectedUrl.includes('refresh_token='), 'Redirect URL should include refresh_token');
+    assert.ok(!redirectedUrl.includes('access_token='), 'Redirect URL must NOT expose access_token as query param');
+    assert.ok(!redirectedUrl.includes('refresh_token='), 'Redirect URL must NOT expose refresh_token as query param');
     assert.ok(redirectedUrl.includes('is_new_user=false'), 'Existing user is_new_user should be false');
-    console.log('  ✓ Controller callback success: redirects to web app with JWTs and query params');
+
+    // Tokens must be delivered via httpOnly, SameSite=lax cookies
+    const accessCookie = cookiesSet.find((c) => c.name === 'devpulse_access_token');
+    const refreshCookie = cookiesSet.find((c) => c.name === 'devpulse_refresh_token');
+    assert.ok(accessCookie, 'Must set devpulse_access_token cookie');
+    assert.ok(refreshCookie, 'Must set devpulse_refresh_token cookie');
+    assert.strictEqual(accessCookie!.options.httpOnly, true, 'access token cookie must be httpOnly');
+    assert.strictEqual(accessCookie!.options.sameSite, 'lax', 'access token cookie must be sameSite=lax');
+    assert.strictEqual(refreshCookie!.options.httpOnly, true, 'refresh token cookie must be httpOnly');
+    assert.strictEqual(refreshCookie!.options.sameSite, 'lax', 'refresh token cookie must be sameSite=lax');
+
+    console.log('  ✓ Controller callback success: tokens delivered as httpOnly cookies, redirect URL is token-free');
   }
 
   // 26. Callback Denial Scenario: access_denied query from GitHub

@@ -20,6 +20,30 @@ import { AuthTokenPayload } from '@devpulse/types';
 import { AuthenticationException } from '../common/errors';
 import { config } from '@devpulse/config';
 
+/** Cookie name for the short-lived JWT access token */
+const ACCESS_TOKEN_COOKIE = 'devpulse_access_token';
+/** Cookie name for the long-lived opaque refresh token */
+const REFRESH_TOKEN_COOKIE = 'devpulse_refresh_token';
+
+/** Sets access + refresh tokens as httpOnly, SameSite=lax cookies. */
+function setTokenCookies(res: Response, accessToken: string, refreshToken: string): void {
+  const isProduction = config.app.isProduction;
+  res.cookie(ACCESS_TOKEN_COOKIE, accessToken, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 15 * 60 * 1000, // 15 minutes
+  });
+  res.cookie(REFRESH_TOKEN_COOKIE, refreshToken, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  });
+}
+
 export class RefreshDto {
   refreshToken?: string;
 }
@@ -146,11 +170,14 @@ export class AuthController {
       currentUser?.sub,
     );
 
-    // Redirect to the web app carrying the token pair as query params.
+    // Deliver tokens via httpOnly, SameSite=lax cookies — never in URL params,
+    // response bodies, or redirect query strings where they could leak into
+    // browser history, server logs, or Referer headers.
+    setTokenCookies(res, tokens.accessToken, tokens.refreshToken);
+
+    // Redirect to the web app with only non-sensitive session metadata.
     const webUrl = config.urls.web;
     const redirectUrl = new URL('/auth/callback', webUrl);
-    redirectUrl.searchParams.set('access_token', tokens.accessToken);
-    redirectUrl.searchParams.set('refresh_token', tokens.refreshToken);
     redirectUrl.searchParams.set('token_type', tokens.tokenType);
     redirectUrl.searchParams.set('expires_in', String(tokens.expiresIn));
     redirectUrl.searchParams.set('is_new_user', String(isNewUser));
@@ -294,23 +321,8 @@ export class AuthController {
       },
     });
 
-    // Set secure httpOnly cookies
-    const isProduction = config.app.isProduction;
-    res.cookie('devpulse_access_token', accessToken, {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: 'lax',
-      path: '/',
-      maxAge: 15 * 60 * 1000, // 15 minutes
-    });
-
-    res.cookie('devpulse_refresh_token', newRefreshToken, {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: 'lax',
-      path: '/',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    });
+    // Deliver new tokens via httpOnly, SameSite=lax cookies — never in the response body.
+    setTokenCookies(res, accessToken, newRefreshToken);
 
     // Never return access or refresh tokens in API response bodies
     return {
