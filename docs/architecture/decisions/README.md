@@ -12,6 +12,7 @@ Architecture Decision Records (ADRs) capture important architectural and design 
 | [ADR-0004](0004-postgresql-and-prisma-orm.md) | PostgreSQL Database with Prisma ORM | Accepted | 2026-10-05 |
 | [ADR-0005](0005-isolated-github-integration-package.md) | Isolated GitHub Integration Package (`@devpulse/github`) | Accepted | 2026-10-13 |
 | [ADR-0006](0006-centralized-zod-environment-configuration.md) | Centralized Configuration with Zod Validation (`@devpulse/config`) | Accepted | 2026-10-13 |
+| [ADR-0007](0007-secure-token-management-at-rest.md) | Secure Token Management at Rest and Zero Token Leakage in API Responses | Accepted | 2026-10-29 |
 
 ---
 

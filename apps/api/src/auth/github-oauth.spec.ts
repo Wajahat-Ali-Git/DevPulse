@@ -482,7 +482,11 @@ async function testIdentityAssociation() {
     assert.strictEqual(result.isNewAccount, true);
     assert.strictEqual(createdAccountData.userId, 'usr_me');
     assert.strictEqual(createdAccountData.username, 'octocat');
-    assert.strictEqual(createdAccountData.accessToken, dummyTokenResponse.access_token);
+    // Token is encrypted at rest using AES-256-GCM envelope
+    assert.notStrictEqual(createdAccountData.accessToken, dummyTokenResponse.access_token);
+    assert.ok(createdAccountData.accessToken.startsWith('v1:'));
+    assert.strictEqual(authService.decryptToken(createdAccountData.accessToken), dummyTokenResponse.access_token);
+    assert.strictEqual(authService.decryptToken(createdAccountData.refreshToken), dummyTokenResponse.refresh_token);
     assert.strictEqual(updatedUserData.avatarUrl, dummyGithubUser.avatar_url);
     assert.strictEqual(commitLinked, true);
     assert.strictEqual(prLinked, true);
@@ -530,7 +534,11 @@ async function testIdentityAssociation() {
 
     assert.strictEqual(result.user.id, 'usr_me');
     assert.strictEqual(result.isNewAccount, false);
-    assert.strictEqual(updatedAccountData.accessToken, dummyTokenResponse.access_token);
+    // Token is encrypted at rest using AES-256-GCM envelope
+    assert.notStrictEqual(updatedAccountData.accessToken, dummyTokenResponse.access_token);
+    assert.ok(updatedAccountData.accessToken.startsWith('v1:'));
+    assert.strictEqual(authService.decryptToken(updatedAccountData.accessToken), dummyTokenResponse.access_token);
+    assert.strictEqual(authService.decryptToken(updatedAccountData.refreshToken), dummyTokenResponse.refresh_token);
     assert.strictEqual(updatedAccountData.username, 'octocat');
     console.log('  ✓ Updates tokens and metadata for already-linked GitHub account');
   }

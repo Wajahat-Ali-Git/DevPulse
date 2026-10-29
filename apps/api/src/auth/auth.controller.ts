@@ -4,12 +4,13 @@ import {
   Post,
   Body,
   Query,
+  Req,
   Res,
   UseGuards,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
-import { Response } from 'express';
+import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { GitHubOAuthService } from './github-oauth.service';
 import { DatabaseService } from '../database.service';
@@ -20,7 +21,7 @@ import { AuthenticationException } from '../common/errors';
 import { config } from '@devpulse/config';
 
 export class RefreshDto {
-  refreshToken!: string;
+  refreshToken?: string;
 }
 
 export class AssociateGitHubDto {
@@ -215,16 +216,32 @@ export class AuthController {
 
   /**
    * Refreshes JWT access token using opaque refresh token with rotation.
+   * Access and refresh tokens are securely stored/rotated via httpOnly cookies
+   * and never leaked in the JSON response body.
    * Public route.
    */
   @Public()
   @Post('refresh')
-  async refreshTokens(@Body() body: RefreshDto) {
-    if (!body?.refreshToken) {
+  @HttpCode(HttpStatus.OK)
+  async refreshTokens(
+    @Body() body: RefreshDto,
+    @Res({ passthrough: true }) res: Response,
+    @Req() req?: Request,
+  ) {
+    // 1. Resolve refresh token from body or httpOnly cookie
+    let rawRefreshToken = body?.refreshToken;
+    if (!rawRefreshToken && req?.headers?.cookie) {
+      const match = req.headers.cookie.match(/(?:^|;\s*)devpulse_refresh_token=([^;]+)/);
+      if (match) {
+        rawRefreshToken = decodeURIComponent(match[1]);
+      }
+    }
+
+    if (!rawRefreshToken) {
       throw new AuthenticationException('Refresh token is required');
     }
 
-    const tokenHash = this.authService.hashToken(body.refreshToken);
+    const tokenHash = this.authService.hashToken(rawRefreshToken);
 
     const existingToken = await this.databaseService.client.refreshToken.findUnique({
       where: { tokenHash },
@@ -277,9 +294,27 @@ export class AuthController {
       },
     });
 
+    // Set secure httpOnly cookies
+    const isProduction = config.app.isProduction;
+    res.cookie('devpulse_access_token', accessToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 15 * 60 * 1000, // 15 minutes
+    });
+
+    res.cookie('devpulse_refresh_token', newRefreshToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    });
+
+    // Never return access or refresh tokens in API response bodies
     return {
-      accessToken,
-      refreshToken: newRefreshToken,
+      success: true,
       tokenType: 'Bearer',
       expiresIn: 900,
     };

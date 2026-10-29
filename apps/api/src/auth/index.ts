@@ -1,3 +1,4 @@
+export * from './token-encryption.service';
 export * from './auth.service';
 export * from './github-oauth.service';
 export * from './auth.controller';

@@ -307,14 +307,19 @@ export class GitHubOAuthService {
       ? new Date(Date.now() + tokenResponse.expires_in * 1000)
       : null;
 
+    const encryptedAccessToken = this.authService.encryptToken(tokenResponse.access_token);
+    const encryptedRefreshToken = tokenResponse.refresh_token
+      ? this.authService.encryptToken(tokenResponse.refresh_token)
+      : null;
+
     const accountData = {
       username: githubUser.login,
       displayName,
       email,
       avatarUrl: githubUser.avatar_url,
       profileUrl: githubUser.html_url,
-      accessToken: tokenResponse.access_token,
-      refreshToken: tokenResponse.refresh_token ?? null,
+      accessToken: encryptedAccessToken,
+      refreshToken: encryptedRefreshToken,
       tokenExpiresAt,
       scopes: [...GITHUB_OAUTH_SCOPES],
     };
@@ -536,14 +541,19 @@ export class GitHubOAuthService {
       ? new Date(Date.now() + tokenResponse.expires_in * 1000)
       : null;
 
+    const encryptedAccessToken = this.authService.encryptToken(tokenResponse.access_token);
+    const encryptedRefreshToken = tokenResponse.refresh_token
+      ? this.authService.encryptToken(tokenResponse.refresh_token)
+      : null;
+
     const accountData = {
       username: githubUser.login,
       displayName,
       email,
       avatarUrl: githubUser.avatar_url,
       profileUrl: githubUser.html_url,
-      accessToken: tokenResponse.access_token,
-      refreshToken: tokenResponse.refresh_token ?? null,
+      accessToken: encryptedAccessToken,
+      refreshToken: encryptedRefreshToken,
       tokenExpiresAt,
       scopes: [...GITHUB_OAUTH_SCOPES],
     };

@@ -4,11 +4,30 @@ import { config } from '@devpulse/config';
 import { AuthTokenPayload, AuthTokens, UserRole } from '@devpulse/types';
 import * as crypto from 'crypto';
 import { AuthenticationException } from '../common/errors';
+import { TokenEncryptionService } from './token-encryption.service';
 
 @Injectable()
 export class AuthService {
   private readonly jwtSecret = config.auth.jwtSecret;
   private readonly jwtExpiresIn = config.auth.jwtExpiresIn || '15m';
+
+  constructor(
+    private readonly tokenEncryptionService: TokenEncryptionService = new TokenEncryptionService(),
+  ) {}
+
+  /**
+   * Encrypts a sensitive token (e.g. GitHub OAuth access/refresh token) at rest.
+   */
+  encryptToken(plainToken: string | null | undefined): string | null {
+    return this.tokenEncryptionService.encrypt(plainToken);
+  }
+
+  /**
+   * Decrypts an encrypted token.
+   */
+  decryptToken(encryptedToken: string | null | undefined): string | null {
+    return this.tokenEncryptionService.decrypt(encryptedToken);
+  }
 
   /**
    * Generates a signed JWT access token.
