@@ -4,11 +4,30 @@ import { config } from '@devpulse/config';
 import { AuthTokenPayload, AuthTokens, UserRole } from '@devpulse/types';
 import * as crypto from 'crypto';
 import { AuthenticationException } from '../common/errors';
+import { TokenEncryptionService } from './token-encryption.service';
 
 @Injectable()
 export class AuthService {
   private readonly jwtSecret = config.auth.jwtSecret;
   private readonly jwtExpiresIn = config.auth.jwtExpiresIn || '15m';
+
+  constructor(
+    private readonly tokenEncryptionService: TokenEncryptionService = new TokenEncryptionService(),
+  ) {}
+
+  /**
+   * Encrypts a sensitive token (e.g. GitHub OAuth access/refresh token) at rest.
+   */
+  encryptToken(plainToken: string | null | undefined): string | null {
+    return this.tokenEncryptionService.encrypt(plainToken);
+  }
+
+  /**
+   * Decrypts an encrypted token.
+   */
+  decryptToken(encryptedToken: string | null | undefined): string | null {
+    return this.tokenEncryptionService.decrypt(encryptedToken);
+  }
 
   /**
    * Generates a signed JWT access token.
@@ -81,6 +100,40 @@ export class AuthService {
       familyId,
       tokenType: 'Bearer',
       expiresIn: 900, // 15 minutes in seconds
+    };
+  }
+
+  /**
+   * Prunes expired and long-revoked refresh tokens and sessions from the database.
+   */
+  async cleanupExpiredTokens(databaseService: { client: any }): Promise<{
+    expiredRefreshTokensDeleted: number;
+    expiredSessionsDeleted: number;
+  }> {
+    const now = new Date();
+    const revokedCutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    const refreshTokensResult = await databaseService.client.refreshToken.deleteMany({
+      where: {
+        OR: [
+          { expiresAt: { lt: now } },
+          { isRevoked: true, revokedAt: { lt: revokedCutoff } },
+        ],
+      },
+    });
+
+    const sessionsResult = await databaseService.client.session.deleteMany({
+      where: {
+        OR: [
+          { expiresAt: { lt: now } },
+          { revokedAt: { not: null } },
+        ],
+      },
+    });
+
+    return {
+      expiredRefreshTokensDeleted: refreshTokensResult?.count ?? 0,
+      expiredSessionsDeleted: sessionsResult?.count ?? 0,
     };
   }
 }

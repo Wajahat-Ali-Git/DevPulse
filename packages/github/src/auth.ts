@@ -142,6 +142,70 @@ export class GitHubAuthApi {
   }
 
   /**
+   * Revokes an OAuth application token using GitHub's Applications API.
+   * DELETE https://api.github.com/applications/{client_id}/token
+   */
+  async revokeToken(
+    options: { accessToken: string },
+    customConfig?: GitHubOAuthConfig
+  ): Promise<boolean> {
+    const clientId = customConfig?.clientId || this.config?.clientId;
+    const clientSecret = customConfig?.clientSecret || this.config?.clientSecret;
+
+    if (!clientId || !clientSecret) {
+      throw new Error('Both clientId and clientSecret are required to revoke OAuth token');
+    }
+
+    const authHeader = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
+
+    const response = await fetch(`https://api.github.com/applications/${clientId}/token`, {
+      method: 'DELETE',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        Authorization: authHeader,
+      },
+      body: JSON.stringify({
+        access_token: options.accessToken,
+      }),
+    });
+
+    return response.status === 204 || response.status === 404;
+  }
+
+  /**
+   * Deletes an app authorization/grant for a user using GitHub's Applications API.
+   * DELETE https://api.github.com/applications/{client_id}/grant
+   */
+  async revokeGrant(
+    options: { accessToken: string },
+    customConfig?: GitHubOAuthConfig
+  ): Promise<boolean> {
+    const clientId = customConfig?.clientId || this.config?.clientId;
+    const clientSecret = customConfig?.clientSecret || this.config?.clientSecret;
+
+    if (!clientId || !clientSecret) {
+      throw new Error('Both clientId and clientSecret are required to revoke OAuth grant');
+    }
+
+    const authHeader = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
+
+    const response = await fetch(`https://api.github.com/applications/${clientId}/grant`, {
+      method: 'DELETE',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        Authorization: authHeader,
+      },
+      body: JSON.stringify({
+        access_token: options.accessToken,
+      }),
+    });
+
+    return response.status === 204 || response.status === 404;
+  }
+
+  /**
    * Returns authenticated user profile using current client token.
    */
   async getAuthenticatedUser(): Promise<GitHubUser> {

@@ -12,7 +12,7 @@ import {
   ApiErrorPayload,
   ApiResponseError,
 } from '@devpulse/types';
-import { Logger, CorrelationContext } from '@devpulse/logger';
+import { Logger, CorrelationContext, redactSensitiveData } from '@devpulse/logger';
 import { AppException } from '../errors/app.exception';
 import { isPrismaError, mapPrismaError } from './prisma-error.util';
 
@@ -307,28 +307,32 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     const method = request?.method || 'UNKNOWN';
     const url = request?.originalUrl || request?.url || '';
 
+    // Redact any credentials or tokens that may have leaked into error context
+    const safeMessage = redactSensitiveData(message);
+    const safeUrl = redactSensitiveData(url);
+
     if (status >= 500) {
       this.logger.error(
-        `[${requestId}] ${method} ${url} - ${status} ${code}: ${
-          exception instanceof Error ? exception.message : message
+        `[${requestId}] ${method} ${safeUrl} - ${status} ${code}: ${
+          exception instanceof Error ? redactSensitiveData(exception.message) : safeMessage
         }`,
-        exception instanceof Error ? exception : undefined,
+        exception instanceof Error ? redactSensitiveData(exception) : undefined,
         {
           statusCode: status,
           errorCode: code,
           requestId,
           method,
-          url,
+          url: safeUrl,
           ip: request?.ip,
         },
       );
     } else {
-      this.logger.warn(`[${requestId}] ${method} ${url} - ${status} ${code}: ${message}`, {
+      this.logger.warn(`[${requestId}] ${method} ${safeUrl} - ${status} ${code}: ${safeMessage}`, {
         statusCode: status,
         errorCode: code,
         requestId,
         method,
-        url,
+        url: safeUrl,
       });
     }
   }
