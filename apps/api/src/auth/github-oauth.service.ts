@@ -6,7 +6,8 @@ import { DatabaseService } from '../database.service';
 import { RedisService } from '../redis.service';
 import { AuthService } from './auth.service';
 import { AuthTokens, UserRole } from '@devpulse/types';
-import { AuthenticationException, ConflictException } from '../common/errors';
+import { AuthenticationException, ConflictException, ResourceNotFoundException } from '../common/errors';
+import { logger } from '@devpulse/logger';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -307,14 +308,19 @@ export class GitHubOAuthService {
       ? new Date(Date.now() + tokenResponse.expires_in * 1000)
       : null;
 
+    const encryptedAccessToken = this.authService.encryptToken(tokenResponse.access_token);
+    const encryptedRefreshToken = tokenResponse.refresh_token
+      ? this.authService.encryptToken(tokenResponse.refresh_token)
+      : null;
+
     const accountData = {
       username: githubUser.login,
       displayName,
       email,
       avatarUrl: githubUser.avatar_url,
       profileUrl: githubUser.html_url,
-      accessToken: tokenResponse.access_token,
-      refreshToken: tokenResponse.refresh_token ?? null,
+      accessToken: encryptedAccessToken,
+      refreshToken: encryptedRefreshToken,
       tokenExpiresAt,
       scopes: [...GITHUB_OAUTH_SCOPES],
     };
@@ -536,14 +542,19 @@ export class GitHubOAuthService {
       ? new Date(Date.now() + tokenResponse.expires_in * 1000)
       : null;
 
+    const encryptedAccessToken = this.authService.encryptToken(tokenResponse.access_token);
+    const encryptedRefreshToken = tokenResponse.refresh_token
+      ? this.authService.encryptToken(tokenResponse.refresh_token)
+      : null;
+
     const accountData = {
       username: githubUser.login,
       displayName,
       email,
       avatarUrl: githubUser.avatar_url,
       profileUrl: githubUser.html_url,
-      accessToken: tokenResponse.access_token,
-      refreshToken: tokenResponse.refresh_token ?? null,
+      accessToken: encryptedAccessToken,
+      refreshToken: encryptedRefreshToken,
       tokenExpiresAt,
       scopes: [...GITHUB_OAUTH_SCOPES],
     };
@@ -687,4 +698,240 @@ export class GitHubOAuthService {
       );
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Account Disconnection & Token Cleanup
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Disconnects a linked GitHub account for an authenticated user and cleans up tokens.
+   *
+   * 1. Validates that the account belongs to the user.
+   * 2. Revokes the OAuth token on GitHub via Applications API (best-effort; non-blocking on failure).
+   * 3. Performs database token cleanup: zeroes out tokens or deletes the account record.
+   * 4. Cleans up Redis caches associated with this account.
+   *
+   * @param userId Authenticated DevPulse user ID
+   * @param accountId Optional specific GitHubAccount ID (defaults to user's linked account)
+   * @param options.purgeAccount If true (default), deletes the GitHubAccount row; if false, zeroes tokens
+   */
+  async disconnectGitHubAccount(
+    userId: string,
+    accountId?: string,
+    options: { purgeAccount?: boolean } = {},
+  ): Promise<{
+    success: boolean;
+    message: string;
+    disconnectedAccount: {
+      id: string;
+      githubUserId: string;
+      username: string;
+    };
+  }> {
+    const db = this.databaseService.client;
+    const purge = options.purgeAccount !== false;
+
+    // 1. Locate the target account
+    let account;
+    if (accountId) {
+      account = await db.gitHubAccount.findFirst({
+        where: { id: accountId, userId },
+      });
+    } else {
+      account = await db.gitHubAccount.findFirst({
+        where: { userId },
+      });
+    }
+
+    if (!account) {
+      throw new ResourceNotFoundException('Linked GitHub account not found for this user.');
+    }
+
+    // 2. Best-effort remote token revocation on GitHub
+    if (account.accessToken) {
+      try {
+        const plainToken = this.authService.decryptToken(account.accessToken);
+        if (plainToken) {
+          await this.githubAuthApi.revokeGrant({ accessToken: plainToken });
+        }
+      } catch (err) {
+        logger.warn(
+          `Failed to remotely revoke GitHub token for account ${account.id}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
+    // 3. Local token cleanup
+    if (purge) {
+      await db.gitHubAccount.delete({
+        where: { id: account.id },
+      });
+    } else {
+      await db.gitHubAccount.update({
+        where: { id: account.id },
+        data: {
+          accessToken: null,
+          refreshToken: null,
+          tokenExpiresAt: null,
+          scopes: [],
+        },
+      });
+    }
+
+    // 4. Redis cache cleanup
+    if (this.redisService?.client) {
+      try {
+        await this.redisService.client.del(`github:account:${account.id}`);
+        await this.redisService.client.del(`github:user:${userId}`);
+      } catch {
+        // Non-fatal if Redis is temporarily unreachable
+      }
+    }
+
+    return {
+      success: true,
+      message: 'GitHub account successfully disconnected and tokens cleaned up',
+      disconnectedAccount: {
+        id: account.id,
+        githubUserId: account.githubUserId.toString(),
+        username: account.username,
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Expired & Revoked Token Handling
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Retrieves a valid, decrypted GitHub access token for the given account.
+   * Handles token expiration by refreshing using the refresh token if available.
+   * If token is expired, revoked, or refresh fails, cleans up the invalidated tokens
+   * and throws an AuthenticationException.
+   */
+  async ensureValidGitHubToken(userId: string, accountId?: string): Promise<string> {
+    const db = this.databaseService.client;
+
+    const account = accountId
+      ? await db.gitHubAccount.findFirst({ where: { id: accountId, userId } })
+      : await db.gitHubAccount.findFirst({ where: { userId } });
+
+    if (!account || !account.accessToken) {
+      throw new AuthenticationException(
+        'GitHub account is not connected or authorization was disconnected. Please reconnect your GitHub account.',
+      );
+    }
+
+    const isExpired = account.tokenExpiresAt
+      ? new Date() >= new Date(new Date(account.tokenExpiresAt).getTime() - 60_000)
+      : false;
+
+    if (!isExpired) {
+      const plainToken = this.authService.decryptToken(account.accessToken);
+      if (!plainToken) {
+        throw new AuthenticationException('Failed to decrypt GitHub access token');
+      }
+      return plainToken;
+    }
+
+    // Token is expired — attempt refresh if refreshToken exists
+    if (!account.refreshToken) {
+      await this.handleRevokedAuthorization(account.id);
+      throw new AuthenticationException(
+        'GitHub authorization has expired. Please reconnect your GitHub account.',
+      );
+    }
+
+    const plainRefreshToken = this.authService.decryptToken(account.refreshToken);
+    if (!plainRefreshToken) {
+      await this.handleRevokedAuthorization(account.id);
+      throw new AuthenticationException(
+        'Failed to decrypt GitHub refresh token. Please reconnect your GitHub account.',
+      );
+    }
+
+    try {
+      const refreshed = await this.githubAuthApi.refreshToken({
+        refreshToken: plainRefreshToken,
+      });
+
+      const encryptedAccess = this.authService.encryptToken(refreshed.access_token);
+      const encryptedRefresh = refreshed.refresh_token
+        ? this.authService.encryptToken(refreshed.refresh_token)
+        : account.refreshToken;
+
+      const newExpiresAt = refreshed.expires_in
+        ? new Date(Date.now() + refreshed.expires_in * 1000)
+        : null;
+
+      await db.gitHubAccount.update({
+        where: { id: account.id },
+        data: {
+          accessToken: encryptedAccess,
+          refreshToken: encryptedRefresh,
+          tokenExpiresAt: newExpiresAt,
+        },
+      });
+
+      return refreshed.access_token;
+    } catch (err) {
+      // Refresh failed (e.g. refresh token revoked on GitHub or expired)
+      await this.handleRevokedAuthorization(account.id);
+      throw new AuthenticationException(
+        'GitHub authorization has expired or was revoked. Please reconnect your GitHub account.',
+      );
+    }
+  }
+
+  /**
+   * Handles revoked or invalidated authorization by zeroing out stored tokens
+   * and evicting cached state.
+   */
+  async handleRevokedAuthorization(accountId: string): Promise<void> {
+    const db = this.databaseService.client;
+    try {
+      await db.gitHubAccount.update({
+        where: { id: accountId },
+        data: {
+          accessToken: null,
+          refreshToken: null,
+          tokenExpiresAt: null,
+          scopes: [],
+        },
+      });
+
+      if (this.redisService?.client) {
+        await this.redisService.client.del(`github:account:${accountId}`);
+      }
+    } catch {
+      // Non-fatal if account was already deleted
+    }
+  }
+
+  /**
+   * Helper to evaluate authorization status of a GitHub account without leaking tokens.
+   */
+  getAccountAuthorizationStatus(account: {
+    accessToken?: string | null;
+    tokenExpiresAt?: Date | null;
+  }): {
+    isConnected: boolean;
+    isExpired: boolean;
+    status: 'CONNECTED' | 'EXPIRED' | 'DISCONNECTED';
+  } {
+    const isConnected = Boolean(account.accessToken);
+    const isExpired = Boolean(
+      account.tokenExpiresAt && new Date() > new Date(account.tokenExpiresAt),
+    );
+    const status = !isConnected
+      ? 'DISCONNECTED'
+      : isExpired
+        ? 'EXPIRED'
+        : 'CONNECTED';
+
+    return { isConnected, isExpired, status };
+  }
+
 }
