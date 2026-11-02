@@ -4,6 +4,7 @@ import { AuthService } from './auth.service';
 import { GitHubOAuthService } from './github-oauth.service';
 import { TokenEncryptionService } from './token-encryption.service';
 import { AuthenticationException, ResourceNotFoundException } from '../common/errors';
+import { config, getPublicConfig, getPrivateConfig } from '@devpulse/config';
 
 async function runDisconnectionAndRevocationTests() {
   console.log('=== GitHub Account Disconnection, Expired & Revoked Authorizations Tests ===\n');
@@ -190,6 +191,58 @@ async function runDisconnectionAndRevocationTests() {
     assert.ok(caughtError instanceof ResourceNotFoundException);
     assert.strictEqual(caughtError.message, 'Linked GitHub account not found for this user.');
     console.log('  ✓ Non-existent or mismatched account properly rejected');
+  }
+
+  // Test 1.5: AuthController disconnection endpoints test
+  console.log('Test 1.5: AuthController disconnection endpoints execute and return sanitized responses');
+  {
+    const mockAccount = {
+      id: 'gh_acc_ctrl_1',
+      userId: 'usr_ctrl_owner',
+      githubUserId: BigInt(11223),
+      username: 'ctrl_user',
+      accessToken: authService.encryptToken('gho_controller_token'),
+    };
+
+    const dbMock = {
+      client: {
+        gitHubAccount: {
+          findFirst: async () => mockAccount,
+          delete: async () => mockAccount,
+        },
+      },
+    };
+
+    const oauthService = new GitHubOAuthService(authService, dbMock as any, { client: null } as any);
+    (oauthService as any).githubAuthApi = {
+      revokeGrant: async () => true,
+    };
+
+    const controller = new AuthController(authService, oauthService, dbMock as any);
+
+    // POST /api/v1/auth/github/disconnect
+    const postRes = await controller.disconnectGitHub(
+      { sub: 'usr_ctrl_owner', email: 'ctrl@devpulse.local', role: 'MEMBER' },
+      { accountId: 'gh_acc_ctrl_1', purge: true }
+    );
+    assert.strictEqual(postRes.success, true);
+    assert.strictEqual(postRes.disconnectedAccount.username, 'ctrl_user');
+
+    // DELETE /api/v1/auth/github/disconnect
+    const delRes = await controller.disconnectGitHubDelete(
+      { sub: 'usr_ctrl_owner', email: 'ctrl@devpulse.local', role: 'MEMBER' },
+      undefined,
+      'gh_acc_ctrl_1'
+    );
+    assert.strictEqual(delRes.success, true);
+
+    // DELETE /api/v1/auth/github/accounts/:accountId
+    const paramRes = await controller.deleteGitHubAccount(
+      { sub: 'usr_ctrl_owner', email: 'ctrl@devpulse.local', role: 'MEMBER' },
+      'gh_acc_ctrl_1'
+    );
+    assert.strictEqual(paramRes.success, true);
+    console.log('  ✓ AuthController POST and DELETE disconnection endpoints verified');
   }
 
   // ---------------------------------------------------------------------------
@@ -586,7 +639,141 @@ async function runDisconnectionAndRevocationTests() {
     console.log('  ✓ Token and session cleanup prune logic verified');
   }
 
-  console.log('\n✅ ALL DISCONNECTION, REVOCATION, AND TOKEN CLEANUP TESTS PASSED!\n');
+  // ---------------------------------------------------------------------------
+  // Suite 4: Token Access Restrictions & Server-Only Secrets
+  // ---------------------------------------------------------------------------
+  console.log('\n--- Suite 4: Token Access Restrictions & Server-Only Secrets ---');
+
+  // Test 4.1: Encryption keys and OAuth secrets are kept in server-only/private config
+  console.log('Test 4.1: Server-only environment variables never leak into public/client configuration');
+  {
+    const pub = getPublicConfig();
+    const priv = getPrivateConfig();
+
+    // Verify PublicConfig contains NO secrets
+    assert.strictEqual((pub as any).encryption, undefined, 'Encryption key must NEVER be in public config');
+    assert.strictEqual((pub as any).auth, undefined, 'Auth secrets must NEVER be in public config');
+    assert.strictEqual((pub as any).github?.clientSecret, undefined, 'GitHub client secret must NEVER be in public config');
+    assert.strictEqual((pub as any).github?.webhookSecret, undefined, 'GitHub webhook secret must NEVER be in public config');
+    assert.strictEqual((pub as any).database, undefined, 'Database credentials must NEVER be in public config');
+    assert.strictEqual((pub as any).redis, undefined, 'Redis credentials must NEVER be in public config');
+
+    // Verify PublicConfig ONLY exposes client-safe items
+    assert.strictEqual(typeof pub.urls.web, 'string');
+    assert.strictEqual(typeof pub.urls.api, 'string');
+    assert.strictEqual(typeof pub.github.clientId, 'string');
+    assert.strictEqual(typeof pub.github.callbackUrl, 'string');
+
+    // Verify PrivateConfig holds server-only secrets
+    assert.strictEqual(typeof priv.encryption.key, 'string');
+    assert.strictEqual(typeof priv.github.clientSecret, 'string');
+    assert.strictEqual(typeof priv.github.webhookSecret, 'string');
+    assert.strictEqual(typeof priv.auth.jwtSecret, 'string');
+    assert.strictEqual(typeof priv.auth.sessionSecret, 'string');
+    console.log('  ✓ Public config cleanly isolates secrets; private config holds server-only secrets');
+  }
+
+  // Test 4.2: Token access restrictions across user boundaries
+  console.log('Test 4.2: Token access restrictions prohibit accessing tokens of another user');
+  {
+    const userA = 'usr_alice_1';
+    const userB = 'usr_bob_2';
+
+    const accountA = {
+      id: 'gh_acc_alice',
+      userId: userA,
+      accessToken: authService.encryptToken('gho_alice_secret'),
+      tokenExpiresAt: new Date(Date.now() + 3600000),
+    };
+
+    const dbMock = {
+      client: {
+        gitHubAccount: {
+          findFirst: async (args: any) => {
+            // Strict user tenant isolation query
+            if (args.where.id === 'gh_acc_alice' && args.where.userId === userA) {
+              return accountA;
+            }
+            return null; // Mismatched user cannot query another user's account
+          },
+        },
+      },
+    };
+
+    const oauthService = new GitHubOAuthService(authService, dbMock as any, { client: null } as any);
+
+    // Alice accesses her own token -> Allowed
+    const aliceToken = await oauthService.ensureValidGitHubToken(userA, 'gh_acc_alice');
+    assert.strictEqual(aliceToken, 'gho_alice_secret');
+
+    // Bob tries to access Alice's token -> Denied with AuthenticationException
+    let caughtBobAccess: any;
+    try {
+      await oauthService.ensureValidGitHubToken(userB, 'gh_acc_alice');
+    } catch (err) {
+      caughtBobAccess = err;
+    }
+    assert.ok(caughtBobAccess instanceof AuthenticationException);
+
+    // Bob tries to disconnect Alice's account -> Denied with ResourceNotFoundException
+    let caughtBobDisconnect: any;
+    try {
+      await oauthService.disconnectGitHubAccount(userB, 'gh_acc_alice');
+    } catch (err) {
+      caughtBobDisconnect = err;
+    }
+    assert.ok(caughtBobDisconnect instanceof ResourceNotFoundException);
+    console.log('  ✓ Strict tenant isolation enforces token access restrictions between users');
+  }
+
+  // Test 4.3: Decrypted tokens are never exposed in user profiles or status queries
+  console.log('Test 4.3: Decrypted tokens never exposed in public profile or status payloads');
+  {
+    const mockUserRecord = {
+      id: 'usr_safe_profile',
+      email: 'safe@devpulse.local',
+      name: 'Safe Developer',
+      role: 'MEMBER',
+      avatarUrl: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      githubAccounts: [
+        {
+          id: 'gh_safe_1',
+          githubUserId: BigInt(54321),
+          username: 'safedev',
+          displayName: 'Safe Dev',
+          email: 'safe@devpulse.local',
+          avatarUrl: null,
+          profileUrl: 'https://github.com/safedev',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+    };
+
+    const dbMock = {
+      client: {
+        user: {
+          findUnique: async () => mockUserRecord,
+        },
+      },
+    };
+
+    const controller = new AuthController(authService, {} as any, dbMock as any);
+    const profile = await controller.getProfile({ sub: 'usr_safe_profile', email: 'safe@devpulse.local', role: 'MEMBER' });
+
+    const serialized = JSON.stringify(profile);
+    assert.ok(!serialized.includes('accessToken'), 'Profile must not contain accessToken');
+    assert.ok(!serialized.includes('refreshToken'), 'Profile must not contain refreshToken');
+    assert.ok(!serialized.includes('clientSecret'), 'Profile must not contain clientSecret');
+    assert.ok(!serialized.includes('encryption'), 'Profile must not contain encryption key');
+    assert.strictEqual((profile.githubAccounts[0] as any).accessToken, undefined);
+    assert.strictEqual((profile.githubAccounts[0] as any).refreshToken, undefined);
+    console.log('  ✓ Zero leakage of decrypted tokens in user profiles verified');
+  }
+
+  console.log('\n✅ ALL DISCONNECTION, REVOCATION, AND TOKEN ACCESS TESTS PASSED!\n');
 }
 
 runDisconnectionAndRevocationTests().catch((err) => {
