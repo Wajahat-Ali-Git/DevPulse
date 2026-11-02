@@ -102,4 +102,38 @@ export class AuthService {
       expiresIn: 900, // 15 minutes in seconds
     };
   }
+
+  /**
+   * Prunes expired and long-revoked refresh tokens and sessions from the database.
+   */
+  async cleanupExpiredTokens(databaseService: { client: any }): Promise<{
+    expiredRefreshTokensDeleted: number;
+    expiredSessionsDeleted: number;
+  }> {
+    const now = new Date();
+    const revokedCutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    const refreshTokensResult = await databaseService.client.refreshToken.deleteMany({
+      where: {
+        OR: [
+          { expiresAt: { lt: now } },
+          { isRevoked: true, revokedAt: { lt: revokedCutoff } },
+        ],
+      },
+    });
+
+    const sessionsResult = await databaseService.client.session.deleteMany({
+      where: {
+        OR: [
+          { expiresAt: { lt: now } },
+          { revokedAt: { not: null } },
+        ],
+      },
+    });
+
+    return {
+      expiredRefreshTokensDeleted: refreshTokensResult?.count ?? 0,
+      expiredSessionsDeleted: sessionsResult?.count ?? 0,
+    };
+  }
 }

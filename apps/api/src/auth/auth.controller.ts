@@ -2,6 +2,8 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
+  Param,
   Body,
   Query,
   Req,
@@ -14,6 +16,7 @@ import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { GitHubOAuthService } from './github-oauth.service';
 import { DatabaseService } from '../database.service';
+import { RedisService } from '../redis.service';
 import { Public, CurrentUser } from './decorators';
 import { GitHubOAuthGuard } from './guards';
 import { AuthTokenPayload } from '@devpulse/types';
@@ -44,6 +47,26 @@ function setTokenCookies(res: Response, accessToken: string, refreshToken: strin
   });
 }
 
+/** Clears access and refresh token cookies. */
+function clearTokenCookies(res: Response): void {
+  const isProduction = config.app.isProduction;
+  res.cookie(ACCESS_TOKEN_COOKIE, '', {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 0,
+  });
+  res.cookie(REFRESH_TOKEN_COOKIE, '', {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 0,
+  });
+}
+
+
 export class RefreshDto {
   refreshToken?: string;
 }
@@ -59,6 +82,7 @@ export class AuthController {
     private readonly authService: AuthService,
     private readonly githubOAuthService: GitHubOAuthService,
     private readonly databaseService: DatabaseService,
+    private readonly redisService?: RedisService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -331,4 +355,182 @@ export class AuthController {
       expiresIn: 900,
     };
   }
+
+  // ---------------------------------------------------------------------------
+  // GitHub Account Disconnection & Token Cleanup
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Disconnects a linked GitHub account, revokes OAuth grant remotely,
+   * and cleans up all credentials and tokens.
+   * Protected route.
+   *
+   * POST /api/v1/auth/github/disconnect
+   * DELETE /api/v1/auth/github/disconnect
+   */
+  @Post('github/disconnect')
+  @HttpCode(HttpStatus.OK)
+  async disconnectGitHub(
+    @CurrentUser() user: AuthTokenPayload,
+    @Body() body?: { accountId?: string; purge?: boolean },
+    @Query('accountId') queryAccountId?: string,
+  ) {
+    const accountId = body?.accountId || queryAccountId;
+    const purgeAccount = body?.purge !== false;
+    return this.githubOAuthService.disconnectGitHubAccount(user.sub, accountId, { purgeAccount });
+  }
+
+  @Delete('github/disconnect')
+  @HttpCode(HttpStatus.OK)
+  async disconnectGitHubDelete(
+    @CurrentUser() user: AuthTokenPayload,
+    @Body() body?: { accountId?: string; purge?: boolean },
+    @Query('accountId') queryAccountId?: string,
+  ) {
+    const accountId = body?.accountId || queryAccountId;
+    const purgeAccount = body?.purge !== false;
+    return this.githubOAuthService.disconnectGitHubAccount(user.sub, accountId, { purgeAccount });
+  }
+
+  /**
+   * Deletes and disconnects a specific GitHub account by ID.
+   * Protected route.
+   *
+   * DELETE /api/v1/auth/github/accounts/:accountId
+   */
+  @Delete('github/accounts/:accountId')
+  @HttpCode(HttpStatus.OK)
+  async deleteGitHubAccount(
+    @CurrentUser() user: AuthTokenPayload,
+    @Param('accountId') accountId: string,
+    @Query('purge') purgeQuery?: string,
+  ) {
+    const purgeAccount = purgeQuery !== 'false';
+    return this.githubOAuthService.disconnectGitHubAccount(user.sub, accountId, { purgeAccount });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Logout & Session Revocation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Single session logout: marks current session as revoked, revokes current refresh token,
+   * blacklists session in Redis, and clears httpOnly auth cookies.
+   * Protected route.
+   *
+   * POST /api/v1/auth/logout
+   */
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  async logout(
+    @CurrentUser() user: AuthTokenPayload,
+    @Res({ passthrough: true }) res: Response,
+    @Req() req?: Request,
+  ) {
+    // 1. Resolve refresh token from body or cookie
+    let rawRefreshToken;
+    if (req?.headers?.cookie) {
+      const match = req.headers.cookie.match(/(?:^|;\s*)devpulse_refresh_token=([^;]+)/);
+      if (match) {
+        rawRefreshToken = decodeURIComponent(match[1]);
+      }
+    }
+
+    if (rawRefreshToken) {
+      const tokenHash = this.authService.hashToken(rawRefreshToken);
+      const existingToken = await this.databaseService.client.refreshToken.findUnique({
+        where: { tokenHash },
+      });
+      if (existingToken) {
+        await this.databaseService.client.refreshToken.updateMany({
+          where: { familyId: existingToken.familyId },
+          data: { isRevoked: true, revokedAt: new Date() },
+        });
+      }
+    }
+
+    // 2. Revoke session if user has sessionId in token
+    if (user?.sessionId) {
+      await this.databaseService.client.session.updateMany({
+        where: { id: user.sessionId, userId: user.sub },
+        data: { revokedAt: new Date() },
+      });
+
+      if (this.redisService?.client) {
+        try {
+          await this.redisService.client.set(
+            `session:revoked:${user.sessionId}`,
+            '1',
+            'EX',
+            7 * 24 * 60 * 60,
+          );
+        } catch {
+          // ignore redis failure
+        }
+      }
+    }
+
+    // 3. Clear auth cookies
+    clearTokenCookies(res);
+
+    return {
+      success: true,
+      message: 'Successfully logged out',
+    };
+  }
+
+  /**
+   * Global logout (all devices): revokes all sessions and all refresh tokens
+   * for the user, blacklists sessions in Redis, and clears cookies.
+   * Protected route.
+   *
+   * POST /api/v1/auth/logout-all
+   */
+  @Post('logout-all')
+  @HttpCode(HttpStatus.OK)
+  async logoutAll(
+    @CurrentUser() user: AuthTokenPayload,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    // 1. Revoke all refresh tokens
+    await this.databaseService.client.refreshToken.updateMany({
+      where: { userId: user.sub },
+      data: { isRevoked: true, revokedAt: new Date() },
+    });
+
+    // 2. Revoke all sessions in DB & Redis
+    const sessions = await this.databaseService.client.session.findMany({
+      where: { userId: user.sub, revokedAt: null },
+      select: { id: true },
+    });
+
+    await this.databaseService.client.session.updateMany({
+      where: { userId: user.sub },
+      data: { revokedAt: new Date() },
+    });
+
+    if (this.redisService?.client && sessions && sessions.length > 0) {
+      try {
+        for (const s of sessions) {
+          await this.redisService.client.set(
+            `session:revoked:${s.id}`,
+            '1',
+            'EX',
+            7 * 24 * 60 * 60,
+          );
+        }
+      } catch {
+        // ignore redis failure
+      }
+    }
+
+    // 3. Clear auth cookies
+    clearTokenCookies(res);
+
+    return {
+      success: true,
+      message: 'Successfully logged out from all devices',
+    };
+  }
+
 }
