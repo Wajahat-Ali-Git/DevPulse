@@ -8,11 +8,30 @@ export interface GitHubRateLimitInfo {
   reset: number; // Unix epoch seconds
   used: number;
   resource?: string;
+  retryAfterSeconds?: number;
 }
 
 export interface GitHubPaginationParams {
   page?: number;
   per_page?: number;
+}
+
+export interface GitHubPageLinks {
+  next?: string;
+  prev?: string;
+  first?: string;
+  last?: string;
+}
+
+export interface GitHubPaginatedResponse<T> {
+  data: T;
+  links: GitHubPageLinks;
+  rateLimit?: GitHubRateLimitInfo;
+}
+
+export interface GitHubPaginationOptions extends GitHubPaginationParams {
+  maxPages?: number;
+  maxItems?: number;
 }
 
 export interface GitHubUser {
