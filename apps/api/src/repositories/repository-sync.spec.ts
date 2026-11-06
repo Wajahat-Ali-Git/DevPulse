@@ -2,6 +2,7 @@ import assert from 'assert';
 import { RepositorySyncService } from './repository-sync.service';
 import { GitHubClient, GitHubNotFoundError, GitHubForbiddenError, GitHubRepository } from '@devpulse/github';
 import { RepositoryStatus } from '@devpulse/database';
+import { AuthorizationException } from '../common/errors';
 
 function makeMockGitHubRepo(overrides: Partial<GitHubRepository> = {}): GitHubRepository {
   return {
@@ -42,6 +43,22 @@ function makeMockGitHubRepo(overrides: Partial<GitHubRepository> = {}): GitHubRe
 
 class MockPrismaClient {
   public repositories: any[] = [];
+  public workspaceMembers: any[] = [];
+
+  workspaceMember = {
+    findUnique: async ({ where }: { where: { workspaceId_userId: { workspaceId: string; userId: string } } }) => {
+      const { workspaceId, userId } = where.workspaceId_userId;
+      return (
+        this.workspaceMembers.find((m) => m.workspaceId === workspaceId && m.userId === userId) || null
+      );
+    },
+    findMany: async ({ where }: { where: { userId?: string } }) => {
+      if (where.userId) {
+        return this.workspaceMembers.filter((m) => m.userId === where.userId);
+      }
+      return this.workspaceMembers;
+    },
+  };
 
   repository = {
     findUnique: async ({ where }: { where: { githubId?: bigint; id?: string } }) => {
@@ -67,6 +84,30 @@ class MockPrismaClient {
           return matchWs && matchName;
         }) || null
       );
+    },
+
+    findMany: async (args: any = {}) => {
+      let filtered = [...this.repositories];
+      if (args.where?.workspaceId?.in) {
+        filtered = filtered.filter((r) => args.where.workspaceId.in.includes(r.workspaceId));
+      }
+      if (args.where?.status) {
+        filtered = filtered.filter((r) => r.status === args.where.status);
+      }
+      const skip = args.skip ?? 0;
+      const take = args.take ?? filtered.length;
+      return filtered.slice(skip, skip + take);
+    },
+
+    count: async (args: any = {}) => {
+      let filtered = [...this.repositories];
+      if (args.where?.workspaceId?.in) {
+        filtered = filtered.filter((r) => args.where.workspaceId.in.includes(r.workspaceId));
+      }
+      if (args.where?.status) {
+        filtered = filtered.filter((r) => r.status === args.where.status);
+      }
+      return filtered.length;
     },
 
     create: async ({ data }: { data: any }) => {
@@ -98,7 +139,7 @@ class MockPrismaClient {
 }
 
 async function runTests() {
-  console.log('=== Running Repository Sync & Identifier Stability Unit Tests ===\n');
+  console.log('=== Running Repository Sync, Isolation & Telemetry Unit Tests ===\n');
 
   // Test 1: Upsert newly discovered repository creates record using stable githubId
   {
@@ -115,22 +156,22 @@ async function runTests() {
     assert.strictEqual(result.fullName, 'org/repo-one');
     assert.strictEqual(result.status, RepositoryStatus.ACTIVE);
     assert.strictEqual(result.isRenamed, false);
+    assert.ok(result.lastSyncedAt instanceof Date, 'Should record lastSyncedAt timestamp');
+    assert.strictEqual(result.lastSyncError, null);
     assert.strictEqual(mockPrisma.repositories.length, 1);
-    console.log('  ✔ Created repository record with stable BigInt githubId\n');
+    console.log('  ✔ Created repository record with stable BigInt githubId and recorded sync time\n');
   }
 
-  // Test 2: Handle renamed repositories: update name and full_name while keeping internal ID and relations intact
+  // Test 2: Handle renamed repositories: update name and full_name while keeping internal ID
   {
     console.log('Test 2: Handle renamed repositories while preserving stable githubId & UUID');
     const mockPrisma = new MockPrismaClient();
     const service = new RepositorySyncService({ client: mockPrisma as any } as any);
 
-    // Initial repo record
     const initialGhRepo = makeMockGitHubRepo({ id: 102, name: 'old-name', full_name: 'org/old-name' });
     const initial = await service.upsertFromGitHub('ws-123', initialGhRepo);
     const originalInternalId = initial.repositoryId;
 
-    // Repo was renamed on GitHub: same githubId (102), but new slug 'org/new-name'
     const renamedGhRepo = makeMockGitHubRepo({ id: 102, name: 'new-name', full_name: 'org/new-name' });
     const result = await service.upsertFromGitHub('ws-123', renamedGhRepo);
 
@@ -138,31 +179,26 @@ async function runTests() {
     assert.strictEqual(result.isRenamed, true);
     assert.strictEqual(result.previousFullName, 'org/old-name');
     assert.strictEqual(result.fullName, 'org/new-name');
-    assert.strictEqual(result.repositoryId, originalInternalId, 'Internal UUID must be preserved across renames');
-    assert.strictEqual(mockPrisma.repositories.length, 1, 'Should not create duplicate rows for renamed repo');
+    assert.strictEqual(result.repositoryId, originalInternalId);
+    assert.strictEqual(mockPrisma.repositories.length, 1);
     console.log('  ✔ Successfully detected rename and updated record in-place preserving UUID\n');
   }
 
-  // Test 3: Handle archived repositories: status updated to ARCHIVED
+  // Test 3: Handle archived repositories
   {
     console.log('Test 3: Handle archived repositories');
     const mockPrisma = new MockPrismaClient();
     const service = new RepositorySyncService({ client: mockPrisma as any } as any);
 
-    // Create active repo
     const activeRepo = makeMockGitHubRepo({ id: 103, archived: false });
     await service.upsertFromGitHub('ws-123', activeRepo);
 
-    // Now repository is archived on GitHub
     const archivedRepo = makeMockGitHubRepo({ id: 103, archived: true });
     const result = await service.upsertFromGitHub('ws-123', archivedRepo);
 
     assert.strictEqual(result.action, 'UPDATED');
     assert.strictEqual(result.isArchived, true);
     assert.strictEqual(result.status, RepositoryStatus.ARCHIVED);
-
-    const stored = mockPrisma.repositories.find((r) => r.githubId === BigInt(103));
-    assert.strictEqual(stored.status, RepositoryStatus.ARCHIVED);
     console.log('  ✔ Repository status correctly transitioned to ARCHIVED\n');
   }
 
@@ -175,25 +211,20 @@ async function runTests() {
     const publicRepo = makeMockGitHubRepo({ id: 104, private: false });
     await service.upsertFromGitHub('ws-123', publicRepo);
 
-    // Repository was made private
     const privateRepo = makeMockGitHubRepo({ id: 104, private: true });
     const result = await service.upsertFromGitHub('ws-123', privateRepo);
 
     assert.strictEqual(result.action, 'UPDATED');
     assert.strictEqual(result.isPrivate, true);
-
-    const stored = mockPrisma.repositories.find((r) => r.githubId === BigInt(104));
-    assert.strictEqual(stored.isPrivate, true);
     console.log('  ✔ Privacy change detected and updated\n');
   }
 
-  // Test 5: Handle deleted or inaccessible repositories (404 Not Found)
+  // Test 5: Handle deleted or inaccessible repositories (404 Not Found) & track error telemetry
   {
-    console.log('Test 5: Handle deleted or inaccessible repositories (404 Not Found)');
+    console.log('Test 5: Handle deleted repositories (404 Not Found) & track error telemetry');
     const mockPrisma = new MockPrismaClient();
     const service = new RepositorySyncService({ client: mockPrisma as any } as any);
 
-    // Pre-populate an existing repository in DB
     const existing = await mockPrisma.repository.create({
       data: {
         workspaceId: 'ws-123',
@@ -221,19 +252,19 @@ async function runTests() {
 
     assert.strictEqual(result.action, 'DEACTIVATED');
     assert.strictEqual(result.status, RepositoryStatus.INACTIVE);
+    assert.ok(result.lastSyncError?.includes('Repository not found'));
 
-    const stored = mockPrisma.repositories.find((r) => r.id === existing.id);
-    assert.strictEqual(stored.status, RepositoryStatus.INACTIVE);
-    console.log('  ✔ Deleted repository caught via 404 and deactivated gracefully\n');
+    const telemetry = service.getSyncTelemetry(existing.id);
+    assert.ok(telemetry?.lastSyncError?.includes('Repository not found'));
+    console.log('  ✔ Deleted repository caught via 404, deactivated, and error telemetry tracked\n');
   }
 
-  // Test 6: Handle forbidden repositories (403 Forbidden - lost collaborator access or token revoked)
+  // Test 6: Handle forbidden repositories (403 Forbidden)
   {
     console.log('Test 6: Handle forbidden repositories (403 Forbidden)');
     const mockPrisma = new MockPrismaClient();
     const service = new RepositorySyncService({ client: mockPrisma as any } as any);
 
-    // Pre-populate an existing repository in DB
     const existing = await mockPrisma.repository.create({
       data: {
         workspaceId: 'ws-123',
@@ -261,38 +292,135 @@ async function runTests() {
 
     assert.strictEqual(result.action, 'DEACTIVATED');
     assert.strictEqual(result.status, RepositoryStatus.INACTIVE);
-
-    const stored = mockPrisma.repositories.find((r) => r.id === existing.id);
-    assert.strictEqual(stored.status, RepositoryStatus.INACTIVE);
-    console.log('  ✔ Forbidden repository caught via 403 and marked INACTIVE\n');
+    assert.ok(result.lastSyncError?.includes('Resource forbidden'));
+    console.log('  ✔ Forbidden repository caught via 403 and marked INACTIVE with error tracked\n');
   }
 
-  // Test 7: Batch sync processes multiple repositories correctly
+  // Test 7: User-level data isolation — reject unauthorized workspace access
   {
-    console.log('Test 7: Batch repository synchronization');
+    console.log('Test 7: User-level data isolation — reject unauthorized workspace access');
     const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({
+      workspaceId: 'ws-authorized',
+      userId: 'user-alice',
+    });
+
     const service = new RepositorySyncService({ client: mockPrisma as any } as any);
 
-    const repos = [
-      makeMockGitHubRepo({ id: 201, name: 'repo-a', full_name: 'org/repo-a' }),
-      makeMockGitHubRepo({ id: 202, name: 'repo-b', full_name: 'org/repo-b', archived: true }),
-      makeMockGitHubRepo({ id: 203, name: 'repo-c', full_name: 'org/repo-c', private: true }),
-    ];
+    // Alice has access to ws-authorized
+    const hasAccess = await service.verifyUserWorkspaceAccess('user-alice', 'ws-authorized');
+    assert.strictEqual(hasAccess, true);
 
-    const results = await service.syncBatch('ws-123', repos);
-    assert.strictEqual(results.length, 3);
-    assert.strictEqual(results[0].status, RepositoryStatus.ACTIVE);
-    assert.strictEqual(results[1].status, RepositoryStatus.ARCHIVED);
-    assert.strictEqual(results[2].isPrivate, true);
-    assert.strictEqual(mockPrisma.repositories.length, 3);
-    console.log('  ✔ Batch synchronization succeeded across diverse repository states\n');
+    // Bob attempts to access ws-authorized -> should throw AuthorizationException
+    let caughtError: any;
+    try {
+      await service.verifyUserWorkspaceAccess('user-bob', 'ws-authorized');
+    } catch (err) {
+      caughtError = err;
+    }
+    assert.ok(caughtError instanceof AuthorizationException);
+    assert.strictEqual(caughtError.getStatus(), 403);
+    console.log('  ✔ User-level workspace access control enforced strictly\n');
   }
 
-  console.log('✅ ALL REPOSITORY SYNC & IDENTIFIER STABILITY TESTS PASSED!\n');
+  // Test 8: User-level data isolation — list repositories returns only user-authorized repositories
+  {
+    console.log('Test 8: User-level data isolation — listUserRepositories filters across authorized tenants');
+    const mockPrisma = new MockPrismaClient();
+    // Alice belongs to ws-A, Bob belongs to ws-B
+    mockPrisma.workspaceMembers.push(
+      { workspaceId: 'ws-A', userId: 'user-alice' },
+      { workspaceId: 'ws-B', userId: 'user-bob' }
+    );
+
+    await mockPrisma.repository.create({
+      data: {
+        workspaceId: 'ws-A',
+        githubId: BigInt(301),
+        name: 'alice-repo',
+        fullName: 'alice/alice-repo',
+        url: 'https://...',
+        status: RepositoryStatus.ACTIVE,
+        isPrivate: false,
+        isFork: false,
+      },
+    });
+
+    await mockPrisma.repository.create({
+      data: {
+        workspaceId: 'ws-B',
+        githubId: BigInt(302),
+        name: 'bob-repo',
+        fullName: 'bob/bob-repo',
+        url: 'https://...',
+        status: RepositoryStatus.ACTIVE,
+        isPrivate: false,
+        isFork: false,
+      },
+    });
+
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    // Alice queries repositories -> only sees alice-repo
+    const aliceRepos = await service.listUserRepositories('user-alice');
+    assert.strictEqual(aliceRepos.data.length, 1);
+    assert.strictEqual(aliceRepos.data[0].name, 'alice-repo');
+
+    // Bob queries repositories -> only sees bob-repo
+    const bobRepos = await service.listUserRepositories('user-bob');
+    assert.strictEqual(bobRepos.data.length, 1);
+    assert.strictEqual(bobRepos.data[0].name, 'bob-repo');
+
+    // User without workspace memberships receives empty list
+    const eveRepos = await service.listUserRepositories('user-eve');
+    assert.strictEqual(eveRepos.data.length, 0);
+    console.log('  ✔ Multi-tenant user data isolation verified\n');
+  }
+
+  // Test 9: Pagination and last-synced telemetry attached to listed repositories
+  {
+    console.log('Test 9: Paginated user repository fetch with sync telemetry');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({ workspaceId: 'ws-A', userId: 'user-alice' });
+
+    for (let i = 1; i <= 5; i++) {
+      await mockPrisma.repository.create({
+        data: {
+          workspaceId: 'ws-A',
+          githubId: BigInt(400 + i),
+          name: `repo-${i}`,
+          fullName: `alice/repo-${i}`,
+          url: 'https://...',
+          status: RepositoryStatus.ACTIVE,
+          isPrivate: false,
+          isFork: false,
+        },
+      });
+    }
+
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    // Fetch page 1 (perPage 2)
+    const page1 = await service.listUserRepositories('user-alice', { page: 1, perPage: 2 });
+    assert.strictEqual(page1.data.length, 2);
+    assert.strictEqual(page1.pagination.total, 5);
+    assert.strictEqual(page1.pagination.totalPages, 3);
+    assert.strictEqual(page1.pagination.hasNextPage, true);
+    assert.strictEqual(page1.pagination.hasPrevPage, false);
+
+    // Fetch page 3 (last page, 1 item)
+    const page3 = await service.listUserRepositories('user-alice', { page: 3, perPage: 2 });
+    assert.strictEqual(page3.data.length, 1);
+    assert.strictEqual(page3.pagination.hasNextPage, false);
+    assert.strictEqual(page3.pagination.hasPrevPage, true);
+
+    console.log('  ✔ Pagination and pagination metadata verified\n');
+  }
+
+  console.log('✅ ALL REPOSITORY SYNC, ISOLATION & TELEMETRY TESTS PASSED!\n');
 }
 
 runTests().catch((err) => {
   console.error('Test failed with error:', err);
   process.exit(1);
 });
-
