@@ -4,22 +4,136 @@ import { GitHubClient, GitHubNotFoundError, GitHubForbiddenError, GitHubReposito
 import { RepositoryStatus } from '@devpulse/database';
 import { Logger } from '@devpulse/logger';
 import { ResourceNotFoundException, AuthorizationException } from '../common/errors';
-import { SyncRepositoryResult, SyncRepositoryOptions } from './types';
+import {
+  SyncRepositoryResult,
+  SyncRepositoryOptions,
+  SyncExecutionRecord,
+  ListRepositoriesFilter,
+  PaginatedRepositoriesResponse,
+} from './types';
 
 @Injectable()
 export class RepositorySyncService {
   private readonly logger = new Logger({ service: 'api', context: RepositorySyncService.name });
 
+  // In-memory sync telemetry tracking last successful sync timestamp and error per repository
+  private readonly syncStateMap = new Map<string, { lastSyncedAt?: Date; lastSyncError?: string | null }>();
+
   constructor(private readonly databaseService: DatabaseService) {}
 
   /**
+   * Enforces user-level data isolation.
+   * Verifies that the specified user has membership in the workspace.
+   * Throws AuthorizationException if the user is not a member.
+   */
+  async verifyUserWorkspaceAccess(userId: string, workspaceId: string): Promise<boolean> {
+    const prisma = this.databaseService.client;
+    const membership = await prisma.workspaceMember.findUnique({
+      where: {
+        workspaceId_userId: {
+          workspaceId,
+          userId,
+        },
+      },
+    });
+
+    if (!membership) {
+      this.logger.warn(`User ${userId} attempted unauthorized access to workspace ${workspaceId}`);
+      throw new AuthorizationException('You do not have access to this workspace or its repositories');
+    }
+
+    return true;
+  }
+
+  /**
+   * Retrieves repositories accessible to a user within their authorized workspaces,
+   * with pagination and tenant isolation.
+   */
+  async listUserRepositories(
+    userId: string,
+    filter: ListRepositoriesFilter = {}
+  ): Promise<PaginatedRepositoriesResponse<any>> {
+    const prisma = this.databaseService.client;
+    const page = Math.max(1, filter.page ?? 1);
+    const perPage = Math.min(100, Math.max(1, filter.perPage ?? 20));
+
+    // Determine target workspaces authorized for this user
+    let workspaceIds: string[] = [];
+    if (filter.workspaceId) {
+      await this.verifyUserWorkspaceAccess(userId, filter.workspaceId);
+      workspaceIds = [filter.workspaceId];
+    } else {
+      const memberships = await prisma.workspaceMember.findMany({
+        where: { userId },
+        select: { workspaceId: true },
+      });
+      workspaceIds = memberships.map((m) => m.workspaceId);
+    }
+
+    if (workspaceIds.length === 0) {
+      return {
+        data: [],
+        pagination: {
+          page,
+          perPage,
+          total: 0,
+          totalPages: 0,
+          hasNextPage: false,
+          hasPrevPage: false,
+        },
+      };
+    }
+
+    const whereClause: any = {
+      workspaceId: { in: workspaceIds },
+      ...(filter.status ? { status: filter.status } : {}),
+      ...(filter.search
+        ? {
+            OR: [
+              { name: { contains: filter.search, mode: 'insensitive' } },
+              { fullName: { contains: filter.search, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+
+    const [items, total] = await Promise.all([
+      prisma.repository.findMany({
+        where: whereClause,
+        skip: (page - 1) * perPage,
+        take: perPage,
+        orderBy: { updatedAt: 'desc' },
+      }),
+      prisma.repository.count({ where: whereClause }),
+    ]);
+
+    // Augment with last sync telemetry
+    const enriched = items.map((repo) => {
+      const telemetry = this.syncStateMap.get(repo.id);
+      return {
+        ...repo,
+        lastSyncedAt: telemetry?.lastSyncedAt ?? null,
+        lastSyncError: telemetry?.lastSyncError ?? null,
+      };
+    });
+
+    const totalPages = Math.ceil(total / perPage);
+
+    return {
+      data: enriched,
+      pagination: {
+        page,
+        perPage,
+        total,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
+      },
+    };
+  }
+
+  /**
    * Upsert a repository using stable GitHub ID (githubId).
-   * Automatically handles:
-   * 1. Creation if newly tracked.
-   * 2. Renaming: updates name and full_name while keeping internal UUID and associations intact.
-   * 3. Archival: sets status = ARCHIVED if archived on GitHub.
-   * 4. Privacy: updates is_private flag.
-   * 5. Active: restores status = ACTIVE if active on GitHub.
    */
   async upsertFromGitHub(
     workspaceId: string,
@@ -39,7 +153,6 @@ export class RepositorySyncService {
     });
 
     if (!existing) {
-      // Create new repository
       const created = await prisma.repository.create({
         data: {
           workspaceId,
@@ -56,6 +169,8 @@ export class RepositorySyncService {
         },
       });
 
+      const now = new Date();
+      this.recordSyncSuccess(created.id, now);
       this.logger.log(`Created repository record for ${fullName} (githubId: ${githubId})`);
 
       return {
@@ -68,14 +183,14 @@ export class RepositorySyncService {
         isArchived,
         isPrivate: created.isPrivate,
         action: 'CREATED',
+        lastSyncedAt: now,
+        lastSyncError: null,
       };
     }
 
-    // Detect if renamed
+    // Detect changes
     const isRenamed = existing.fullName !== fullName || existing.name !== name;
     const previousFullName = isRenamed ? existing.fullName : undefined;
-
-    // Detect changes
     const isStatusChanged = existing.status !== targetStatus;
     const isPrivacyChanged = existing.isPrivate !== isPrivate;
     const isBranchChanged = existing.defaultBranch !== (githubRepo.default_branch || 'main');
@@ -83,6 +198,8 @@ export class RepositorySyncService {
     const isPushedAtChanged = githubRepo.pushed_at
       ? !existing.pushedAt || existing.pushedAt.toISOString() !== new Date(githubRepo.pushed_at).toISOString()
       : false;
+
+    const now = new Date();
 
     if (isRenamed || isStatusChanged || isPrivacyChanged || isBranchChanged || isDescriptionChanged || isPushedAtChanged) {
       const updated = await prisma.repository.update({
@@ -100,15 +217,11 @@ export class RepositorySyncService {
         },
       });
 
+      this.recordSyncSuccess(updated.id, now);
+
       if (isRenamed) {
         this.logger.log(
           `Repository renamed from ${previousFullName} to ${fullName} (githubId: ${githubId}, id: ${existing.id})`
-        );
-      }
-
-      if (isStatusChanged) {
-        this.logger.log(
-          `Repository ${fullName} status changed from ${existing.status} to ${targetStatus}`
         );
       }
 
@@ -123,8 +236,12 @@ export class RepositorySyncService {
         isArchived,
         isPrivate: updated.isPrivate,
         action: 'UPDATED',
+        lastSyncedAt: now,
+        lastSyncError: null,
       };
     }
+
+    this.recordSyncSuccess(existing.id, now);
 
     return {
       repositoryId: existing.id,
@@ -136,16 +253,13 @@ export class RepositorySyncService {
       isArchived,
       isPrivate: existing.isPrivate,
       action: 'UNCHANGED',
+      lastSyncedAt: now,
+      lastSyncError: null,
     };
   }
 
   /**
-   * Synchronizes a single repository by fetching from GitHub and updating the database.
-   * Gracefully handles:
-   * - 404 Not Found: Repository was deleted or transferred. Deactivates repository record if requested.
-   * - 403 Forbidden: Repository became private or access token lost permission. Marks as INACTIVE.
-   * - Renamed repositories: GitHub redirects old slug to new slug, and stable githubId updates DB record.
-   * - Archived repositories: Marks status as ARCHIVED.
+   * Synchronizes a single repository, tracking completion timestamp and errors.
    */
   async syncRepository(
     gitHubClient: GitHubClient,
@@ -156,11 +270,17 @@ export class RepositorySyncService {
     const prisma = this.databaseService.client;
     const lookupFullName = `${owner}/${repo}`;
 
+    // Enforce tenant user-level access if userId provided
+    if (options.userId) {
+      await this.verifyUserWorkspaceAccess(options.userId, options.workspaceId);
+    }
+
     try {
       const githubRepo = await gitHubClient.repositories.get(owner, repo);
       return await this.upsertFromGitHub(options.workspaceId, githubRepo);
-    } catch (error) {
-      // Handle deleted or transferred repository (404)
+    } catch (error: any) {
+      const errorMsg = error?.message || 'Unknown GitHub API error';
+
       if (error instanceof GitHubNotFoundError) {
         this.logger.warn(`Repository ${lookupFullName} not found on GitHub (deleted or inaccessible)`);
 
@@ -177,6 +297,7 @@ export class RepositorySyncService {
             data: { status: RepositoryStatus.INACTIVE },
           });
 
+          this.recordSyncError(existing.id, errorMsg);
           this.logger.log(`Marked deleted/inaccessible repository ${lookupFullName} as INACTIVE`);
 
           return {
@@ -189,13 +310,13 @@ export class RepositorySyncService {
             isArchived: updated.status === RepositoryStatus.ARCHIVED,
             isPrivate: updated.isPrivate,
             action: 'DEACTIVATED',
+            lastSyncError: errorMsg,
           };
         }
 
         throw new ResourceNotFoundException(`Repository ${lookupFullName} not found on GitHub`);
       }
 
-      // Handle forbidden or lost access (403)
       if (error instanceof GitHubForbiddenError) {
         this.logger.warn(`Access forbidden for repository ${lookupFullName}`);
 
@@ -212,6 +333,7 @@ export class RepositorySyncService {
             data: { status: RepositoryStatus.INACTIVE },
           });
 
+          this.recordSyncError(existing.id, errorMsg);
           this.logger.log(`Marked inaccessible repository ${lookupFullName} as INACTIVE due to 403 Forbidden`);
 
           return {
@@ -224,10 +346,22 @@ export class RepositorySyncService {
             isArchived: updated.status === RepositoryStatus.ARCHIVED,
             isPrivate: updated.isPrivate,
             action: 'DEACTIVATED',
+            lastSyncError: errorMsg,
           };
         }
 
         throw new AuthorizationException(`Access to repository ${lookupFullName} is forbidden or token lacks permission`);
+      }
+
+      // Record sync error on existing repository if identifiable
+      const existing = await prisma.repository.findFirst({
+        where: {
+          workspaceId: options.workspaceId,
+          fullName: { equals: lookupFullName, mode: 'insensitive' },
+        },
+      });
+      if (existing) {
+        this.recordSyncError(existing.id, errorMsg);
       }
 
       throw error;
@@ -235,18 +369,46 @@ export class RepositorySyncService {
   }
 
   /**
-   * Synchronizes multiple repositories for a user or workspace,
-   * handling new, renamed, archived, and deleted/inaccessible repositories.
+   * Synchronizes multiple repositories in batch.
    */
   async syncBatch(
     workspaceId: string,
-    githubRepos: GitHubRepository[]
+    githubRepos: GitHubRepository[],
+    userId?: string
   ): Promise<SyncRepositoryResult[]> {
+    if (userId) {
+      await this.verifyUserWorkspaceAccess(userId, workspaceId);
+    }
+
     const results: SyncRepositoryResult[] = [];
     for (const repo of githubRepos) {
       const res = await this.upsertFromGitHub(workspaceId, repo);
       results.push(res);
     }
     return results;
+  }
+
+  /**
+   * Returns sync telemetry (last success and last error) for a repository.
+   */
+  getSyncTelemetry(repositoryId: string): { lastSyncedAt?: Date; lastSyncError?: string | null } | undefined {
+    return this.syncStateMap.get(repositoryId);
+  }
+
+  private recordSyncSuccess(repositoryId: string, at: Date): void {
+    const existing = this.syncStateMap.get(repositoryId);
+    this.syncStateMap.set(repositoryId, {
+      ...existing,
+      lastSyncedAt: at,
+      lastSyncError: null,
+    });
+  }
+
+  private recordSyncError(repositoryId: string, error: string): void {
+    const existing = this.syncStateMap.get(repositoryId);
+    this.syncStateMap.set(repositoryId, {
+      ...existing,
+      lastSyncError: error,
+    });
   }
 }
