@@ -417,6 +417,148 @@ async function runTests() {
     console.log('  ✔ Pagination and pagination metadata verified\n');
   }
 
+
+  // Test 10: Repeated syncs with identical data (idempotency)
+  {
+    console.log('Test 10: Repeated syncs with unchanged data produces UNCHANGED action without redundant writes');
+    const mockPrisma = new MockPrismaClient();
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    const ghRepo = makeMockGitHubRepo({
+      id: 501,
+      name: 'stable-repo',
+      full_name: 'org/stable-repo',
+      description: 'Original description',
+      default_branch: 'main',
+      pushed_at: '2024-01-01T12:00:00Z',
+    });
+
+    // First sync -> CREATED
+    const firstSync = await service.upsertFromGitHub('ws-123', ghRepo);
+    assert.strictEqual(firstSync.action, 'CREATED');
+    const initialUpdatedAt = mockPrisma.repositories[0].updatedAt;
+
+    // Second sync with exact same data -> UNCHANGED
+    const secondSync = await service.upsertFromGitHub('ws-123', ghRepo);
+    assert.strictEqual(secondSync.action, 'UNCHANGED');
+    assert.strictEqual(secondSync.repositoryId, firstSync.repositoryId);
+    assert.strictEqual(secondSync.isRenamed, false);
+    assert.strictEqual(mockPrisma.repositories.length, 1);
+    assert.strictEqual(mockPrisma.repositories[0].updatedAt.getTime(), initialUpdatedAt.getTime(), 'No DB update when data unchanged');
+
+    // Third sync with exact same data -> UNCHANGED
+    const thirdSync = await service.upsertFromGitHub('ws-123', ghRepo);
+    assert.strictEqual(thirdSync.action, 'UNCHANGED');
+    console.log('  ✔ Repeated syncs are strictly idempotent and return UNCHANGED\n');
+  }
+
+  // Test 11: Repeated sync with changed description, default branch, and pushed_at
+  {
+    console.log('Test 11: Repeated sync detecting changed repository metadata (description, default_branch, pushed_at)');
+    const mockPrisma = new MockPrismaClient();
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    const initialGhRepo = makeMockGitHubRepo({
+      id: 502,
+      name: 'evolving-repo',
+      full_name: 'org/evolving-repo',
+      description: 'Initial description',
+      default_branch: 'master',
+      pushed_at: '2024-01-01T00:00:00Z',
+    });
+
+    const firstSync = await service.upsertFromGitHub('ws-123', initialGhRepo);
+    assert.strictEqual(firstSync.action, 'CREATED');
+
+    // Modified data: updated description, default branch changed to main, and new commit pushed
+    const updatedGhRepo = makeMockGitHubRepo({
+      id: 502,
+      name: 'evolving-repo',
+      full_name: 'org/evolving-repo',
+      description: 'Updated modern documentation and features',
+      default_branch: 'main',
+      pushed_at: '2024-01-05T15:30:00Z',
+    });
+
+    const secondSync = await service.upsertFromGitHub('ws-123', updatedGhRepo);
+    assert.strictEqual(secondSync.action, 'UPDATED');
+    assert.strictEqual(secondSync.repositoryId, firstSync.repositoryId, 'Internal UUID preserved');
+    assert.strictEqual(secondSync.isRenamed, false);
+
+    const stored = mockPrisma.repositories.find((r) => r.githubId === BigInt(502));
+    assert.strictEqual(stored.description, 'Updated modern documentation and features');
+    assert.strictEqual(stored.defaultBranch, 'main');
+    assert.strictEqual(stored.pushedAt.toISOString(), new Date('2024-01-05T15:30:00Z').toISOString());
+    console.log('  ✔ Changed repository metadata detected and updated correctly\n');
+  }
+
+  // Test 12: Recovery transition from INACTIVE back to ACTIVE on subsequent sync
+  {
+    console.log('Test 12: Recovery from INACTIVE back to ACTIVE on subsequent sync');
+    const mockPrisma = new MockPrismaClient();
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    // Repository was previously deactivated (e.g. temporary network / permission loss)
+    const existing = await mockPrisma.repository.create({
+      data: {
+        workspaceId: 'ws-123',
+        githubId: BigInt(503),
+        name: 'recovering-repo',
+        fullName: 'org/recovering-repo',
+        url: 'https://github.com/org/recovering-repo',
+        status: RepositoryStatus.INACTIVE,
+        isPrivate: false,
+        isFork: false,
+      },
+    });
+
+    // Subsequent sync succeeds and repository is active on GitHub
+    const activeGhRepo = makeMockGitHubRepo({
+      id: 503,
+      name: 'recovering-repo',
+      full_name: 'org/recovering-repo',
+      archived: false,
+    });
+
+    const result = await service.upsertFromGitHub('ws-123', activeGhRepo);
+    assert.strictEqual(result.action, 'UPDATED');
+    assert.strictEqual(result.status, RepositoryStatus.ACTIVE);
+
+    const stored = mockPrisma.repositories.find((r) => r.id === existing.id);
+    assert.strictEqual(stored.status, RepositoryStatus.ACTIVE);
+    console.log('  ✔ Inactive repository cleanly restored to ACTIVE status on repeated sync\n');
+  }
+
+  // Test 13: Unarchive transition from ARCHIVED back to ACTIVE on subsequent sync
+  {
+    console.log('Test 13: Unarchive transition from ARCHIVED back to ACTIVE');
+    const mockPrisma = new MockPrismaClient();
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    // Repository initially archived
+    const archivedGhRepo = makeMockGitHubRepo({
+      id: 504,
+      name: 'unarchiving-repo',
+      full_name: 'org/unarchiving-repo',
+      archived: true,
+    });
+    const firstSync = await service.upsertFromGitHub('ws-123', archivedGhRepo);
+    assert.strictEqual(firstSync.status, RepositoryStatus.ARCHIVED);
+
+    // Unarchived on GitHub
+    const unarchivedGhRepo = makeMockGitHubRepo({
+      id: 504,
+      name: 'unarchiving-repo',
+      full_name: 'org/unarchiving-repo',
+      archived: false,
+    });
+    const secondSync = await service.upsertFromGitHub('ws-123', unarchivedGhRepo);
+    assert.strictEqual(secondSync.action, 'UPDATED');
+    assert.strictEqual(secondSync.status, RepositoryStatus.ACTIVE);
+    assert.strictEqual(secondSync.isArchived, false);
+    console.log('  ✔ Repository unarchival recognized and status restored to ACTIVE\n');
+  }
+
   console.log('✅ ALL REPOSITORY SYNC, ISOLATION & TELEMETRY TESTS PASSED!\n');
 }
 
