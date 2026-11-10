@@ -179,3 +179,162 @@ export interface HealthCheckResponse {
   components?: ComponentHealth[];
 }
 
+// ── Background Job & Queue Types ──────────────────────────────────────
+
+/**
+ * Shared BullMQ Queue Names across DevPulse services.
+ */
+export enum QueueName {
+  GITHUB_WEBHOOKS = 'github-webhooks',
+  REPOSITORY_SYNC = 'repository-sync',
+  METRICS_CALCULATION = 'metrics-calculation',
+  NOTIFICATIONS = 'notifications',
+  SAMPLE = 'sample-jobs',
+}
+
+/**
+ * Shared BullMQ Job Names.
+ */
+export enum JobName {
+  // Webhooks
+  PROCESS_WEBHOOK_EVENT = 'process-webhook-event',
+
+  // Repository Sync
+  SYNC_USER_REPOSITORIES = 'sync-user-repositories',
+  SYNC_SINGLE_REPOSITORY = 'sync-single-repository',
+  SYNC_REPOSITORY_COMMITS = 'sync-repository-commits',
+  SYNC_REPOSITORY_PULL_REQUESTS = 'sync-repository-pull-requests',
+
+  // Metrics Calculation
+  CALCULATE_REPOSITORY_METRICS = 'calculate-repository-metrics',
+  CALCULATE_WORKSPACE_METRICS = 'calculate-workspace-metrics',
+
+  // Notifications
+  SEND_EMAIL_NOTIFICATION = 'send-email-notification',
+
+  // Sample / Diagnostic
+  SAMPLE_JOB = 'sample-job',
+}
+
+/**
+ * Generic BullMQ Job Priority levels.
+ */
+export enum JobPriority {
+  LOW = 10,
+  NORMAL = 5,
+  HIGH = 2,
+  CRITICAL = 1,
+}
+
+/**
+ * Payload for GitHub webhook processing job.
+ */
+export interface WebhookEventPayload {
+  deliveryId: string;
+  event: string;
+  action?: string;
+  repositoryId?: string;
+  githubRepoId?: number;
+  sender?: string;
+  rawPayload: Record<string, any>;
+  receivedAt: string;
+}
+
+/**
+ * Payload for synchronizing all repositories belonging to a user/workspace.
+ */
+export interface SyncUserRepositoriesPayload {
+  userId: string;
+  workspaceId: string;
+  installationId?: number;
+  forced?: boolean;
+}
+
+/**
+ * Payload for synchronizing a single repository.
+ */
+export interface SyncSingleRepositoryPayload {
+  repositoryId: string;
+  workspaceId: string;
+  githubRepoId: number;
+  fullName: string;
+  userId?: string;
+  syncCommits?: boolean;
+  syncPullRequests?: boolean;
+}
+
+/**
+ * Payload for synchronizing commits for a repository.
+ */
+export interface SyncRepositoryCommitsPayload {
+  repositoryId: string;
+  workspaceId: string;
+  fullName: string;
+  since?: string;
+  until?: string;
+  page?: number;
+}
+
+/**
+ * Payload for synchronizing pull requests for a repository.
+ */
+export interface SyncRepositoryPullRequestsPayload {
+  repositoryId: string;
+  workspaceId: string;
+  fullName: string;
+  state?: 'open' | 'closed' | 'all';
+}
+
+/**
+ * Payload for calculating repository metrics.
+ */
+export interface CalculateRepositoryMetricsPayload {
+  repositoryId: string;
+  workspaceId: string;
+  from?: string;
+  to?: string;
+}
+
+/**
+ * Payload for calculating workspace aggregate metrics.
+ */
+export interface CalculateWorkspaceMetricsPayload {
+  workspaceId: string;
+  from?: string;
+  to?: string;
+}
+
+/**
+ * Payload for sending notifications.
+ */
+export interface SendEmailNotificationPayload {
+  to: string;
+  subject: string;
+  template: string;
+  context: Record<string, any>;
+}
+
+/**
+ * Sample job payload for diagnostic testing.
+ */
+export interface SampleJobPayload {
+  message: string;
+  timestamp?: number;
+}
+
+/**
+ * Type map linking JobName enum to its typed payload.
+ */
+export interface JobPayloadMap {
+  [JobName.PROCESS_WEBHOOK_EVENT]: WebhookEventPayload;
+  [JobName.SYNC_USER_REPOSITORIES]: SyncUserRepositoriesPayload;
+  [JobName.SYNC_SINGLE_REPOSITORY]: SyncSingleRepositoryPayload;
+  [JobName.SYNC_REPOSITORY_COMMITS]: SyncRepositoryCommitsPayload;
+  [JobName.SYNC_REPOSITORY_PULL_REQUESTS]: SyncRepositoryPullRequestsPayload;
+  [JobName.CALCULATE_REPOSITORY_METRICS]: CalculateRepositoryMetricsPayload;
+  [JobName.CALCULATE_WORKSPACE_METRICS]: CalculateWorkspaceMetricsPayload;
+  [JobName.SEND_EMAIL_NOTIFICATION]: SendEmailNotificationPayload;
+  [JobName.SAMPLE_JOB]: SampleJobPayload;
+}
+
+
