@@ -1,15 +1,19 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
-import { Queue, Job, ConnectionOptions } from 'bullmq';
+import { Queue, ConnectionOptions, JobsOptions } from 'bullmq';
 import { Logger } from '@devpulse/logger';
+import { QueueName, JobName, JobPayloadMap } from '@devpulse/types';
 import { RedisService } from '../redis/redis.service';
 import { JobData } from '../jobs/job.interface';
 
+export interface TypedEnqueueOptions extends JobsOptions {
+  correlationId?: string;
+}
+
 /**
- * QueueService manages BullMQ Queue instances and provides a single
- * entry-point for enqueuing jobs from anywhere in the worker application.
+ * QueueService manages BullMQ Queue instances and provides typed
+ * methods for enqueuing background jobs across DevPulse.
  *
- * BullMQ shares the ioredis connection managed by RedisService so there
- * is only one connection pool for the entire Worker process.
+ * BullMQ shares the Redis connection managed by RedisService.
  */
 @Injectable()
 export class QueueService implements OnModuleDestroy {
@@ -22,34 +26,76 @@ export class QueueService implements OnModuleDestroy {
    * Returns an existing BullMQ Queue or creates a new one for the given name.
    * All queues share the same Redis connection options.
    */
-  private getOrCreateQueue(queueName: string): Queue {
-    if (!this.queues.has(queueName)) {
+  public getOrCreateQueue(queueName: string | QueueName): Queue {
+    const qName = queueName.toString();
+    if (!this.queues.has(qName)) {
       const connection: ConnectionOptions = this.redisService.client;
-      const queue = new Queue(queueName, { connection });
-      this.queues.set(queueName, queue);
-      this.logger.log(`BullMQ queue registered: [${queueName}]`);
+      const queue = new Queue(qName, {
+        connection,
+        defaultJobOptions: {
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 1000,
+          },
+          removeOnComplete: {
+            count: 1000,
+            age: 24 * 3600,
+          },
+          removeOnFail: {
+            count: 5000,
+            age: 7 * 24 * 3600,
+          },
+        },
+      });
+      this.queues.set(qName, queue);
+      this.logger.log(`BullMQ queue registered: [${qName}]`);
     }
-    return this.queues.get(queueName)!;
+    return this.queues.get(qName)!;
+  }
+
+  /**
+   * Strongly-typed helper to add a job with payload corresponding to JobName.
+   */
+  async addTypedJob<K extends keyof JobPayloadMap>(
+    queueName: QueueName | string,
+    jobName: K,
+    payload: JobPayloadMap[K],
+    options?: TypedEnqueueOptions,
+  ): Promise<JobData<JobPayloadMap[K]>> {
+    return this.addJob<JobPayloadMap[K]>(queueName, jobName, payload, options);
   }
 
   /**
    * Adds a named job to the specified BullMQ queue.
-   * Returns the BullMQ Job object that includes the auto-generated ID.
+   * Returns the BullMQ Job object representation with auto-generated ID.
    */
-  async addJob<T>(queueName: string, name: string, payload: T): Promise<JobData<T>> {
+  async addJob<T>(
+    queueName: string | QueueName,
+    name: string,
+    payload: T,
+    options?: JobsOptions,
+  ): Promise<JobData<T>> {
     const queue = this.getOrCreateQueue(queueName);
 
-    const job: Job<T> = await queue.add(name, payload);
+    const job = await queue.add(name, payload, options);
 
     const jobData: JobData<T> = {
       id: job.id ?? `job_${Date.now()}`,
       name,
       payload,
-      createdAt: new Date(),
+      createdAt: new Date(job.timestamp || Date.now()),
     };
 
     this.logger.log(`Job [${jobData.id}] "${name}" added to queue [${queueName}]`);
     return jobData;
+  }
+
+  /**
+   * Returns an array of all active queue names currently managed.
+   */
+  getRegisteredQueueNames(): string[] {
+    return Array.from(this.queues.keys());
   }
 
   /** Gracefully closes all managed queues on shutdown. */
