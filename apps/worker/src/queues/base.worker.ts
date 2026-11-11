@@ -1,6 +1,6 @@
 import { OnModuleDestroy } from '@nestjs/common';
 import { Worker, Job, WorkerOptions, ConnectionOptions, UnrecoverableError } from 'bullmq';
-import { Logger } from '@devpulse/logger';
+import { Logger, CorrelationContext } from '@devpulse/logger';
 import { QueueName } from '@devpulse/types';
 import { RedisService } from '../redis/redis.service';
 import { resolveQueueConcurrency, DefaultQueueConfigs } from './queue.config';
@@ -14,14 +14,30 @@ export interface BaseWorkerConfig {
   };
 }
 
+export interface FailedJobDetails {
+  jobId: string;
+  jobName: string;
+  queue: string;
+  attemptsMade: number;
+  maxAttempts: number;
+  isPermanent: boolean;
+  errorMessage: string;
+  failedReason?: string;
+  stack?: string;
+  correlationId?: string;
+  failedAt: string;
+  payload?: any;
+}
+
 /**
  * Abstract BaseWorker providing uniform lifecycle management, connection handling,
- * structured logging, error normalization (retryable vs permanent), and graceful shutdown.
+ * structured logging with correlation IDs, failed-job handling, and safe shutdown.
  */
 export abstract class BaseWorker<DataType = any, ResultType = any> implements OnModuleDestroy {
   protected abstract readonly queueName: QueueName | string;
   protected readonly logger: Logger;
   protected worker?: Worker<DataType, ResultType>;
+  private isShuttingDown = false;
 
   constructor(
     protected readonly redisService: RedisService,
@@ -60,26 +76,86 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
     this.worker = new Worker<DataType, ResultType>(
       qName,
       async (job: Job<DataType, ResultType>) => {
-        try {
-          return await this.processJob(job);
-        } catch (rawError) {
-          // Normalize error: permanent failures become UnrecoverableError so BullMQ won't retry
-          const normalized = normalizeJobError(rawError);
-          const isRetryable = isRetryableError(rawError);
+        // Extract or generate job correlation ID
+        const correlationId =
+          (job.data as any)?.correlationId ||
+          (job.data as any)?.deliveryId ||
+          job.opts?.jobId ||
+          `job_corr_${job.id}`;
 
-          this.logger.warn(
-            `Job [${job.id}] "${job.name}" encountered ${isRetryable ? 'RETRYABLE' : 'PERMANENT'} failure on [${qName}]: ${normalized.message}`,
-            {
+        return CorrelationContext.run(
+          {
+            service: 'worker',
+            context: this.constructor.name,
+            jobId: String(job.id),
+            correlationId: String(correlationId),
+          },
+          async () => {
+            const startTime = Date.now();
+            this.logger.info(`Starting job execution [${job.id}] "${job.name}" on [${qName}]`, {
               jobId: job.id,
               jobName: job.name,
               queue: qName,
+              correlationId,
               attemptsMade: job.attemptsMade,
-              isRetryable,
-            },
-          );
+              maxAttempts: job.opts?.attempts ?? 1,
+            });
 
-          throw normalized;
-        }
+            try {
+              const result = await this.processJob(job);
+              const durationMs = Date.now() - startTime;
+
+              this.logger.info(`Job execution [${job.id}] "${job.name}" completed successfully in ${durationMs}ms`, {
+                jobId: job.id,
+                jobName: job.name,
+                queue: qName,
+                durationMs,
+                correlationId,
+              });
+
+              return result;
+            } catch (rawError) {
+              const durationMs = Date.now() - startTime;
+              const normalized = normalizeJobError(rawError);
+              const isRetryable = isRetryableError(rawError);
+              const isPermanent = !isRetryable;
+
+              this.logger.warn(
+                `Job execution [${job.id}] "${job.name}" failed after ${durationMs}ms with ${isPermanent ? 'PERMANENT' : 'RETRYABLE'} failure: ${normalized.message}`,
+                {
+                  jobId: job.id,
+                  jobName: job.name,
+                  queue: qName,
+                  durationMs,
+                  correlationId,
+                  attemptsMade: job.attemptsMade,
+                  maxAttempts: job.opts?.attempts ?? 1,
+                  isPermanent,
+                  error: normalized.message,
+                  stack: normalized.stack,
+                },
+              );
+
+              // Hook for failed job processing
+              await this.handleFailedJob({
+                jobId: String(job.id),
+                jobName: job.name,
+                queue: qName,
+                attemptsMade: job.attemptsMade + 1,
+                maxAttempts: job.opts?.attempts ?? 1,
+                isPermanent,
+                errorMessage: normalized.message,
+                failedReason: normalized.message,
+                stack: normalized.stack,
+                correlationId: String(correlationId),
+                failedAt: new Date().toISOString(),
+                payload: job.data,
+              });
+
+              throw normalized;
+            }
+          },
+        );
       },
       options,
     );
@@ -96,13 +172,39 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
   abstract processJob(job: Job<DataType, ResultType>): Promise<ResultType>;
 
   /**
+   * Hook executed whenever a job fails, providing structured failure capture,
+   * dead-letter routing diagnostics, and error reporting.
+   */
+  protected async handleFailedJob(details: FailedJobDetails): Promise<void> {
+    const isExhausted = details.attemptsMade >= details.maxAttempts;
+
+    if (details.isPermanent || isExhausted) {
+      this.logger.error(
+        `Job [${details.jobId}] "${details.jobName}" exhausted retries or suffered permanent failure on [${details.queue}]. Routing to Dead-Letter/Failed set.`,
+        {
+          jobId: details.jobId,
+          jobName: details.jobName,
+          queue: details.queue,
+          correlationId: details.correlationId,
+          attemptsMade: details.attemptsMade,
+          maxAttempts: details.maxAttempts,
+          isPermanent: details.isPermanent,
+          isExhausted,
+          errorMessage: details.errorMessage,
+          failedAt: details.failedAt,
+        },
+      );
+    }
+  }
+
+  /**
    * Registers default lifecycle event listeners for logging and observability.
    */
   protected registerEventListeners(): void {
     if (!this.worker) return;
 
     this.worker.on('completed', (job: Job<DataType, ResultType>) => {
-      this.logger.info(`Job [${job.id}] "${job.name}" completed successfully on [${this.queueName}]`, {
+      this.logger.info(`Job [${job.id}] "${job.name}" acknowledged complete by queue [${this.queueName}]`, {
         jobId: job.id,
         jobName: job.name,
         queue: this.queueName,
@@ -115,7 +217,7 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
       const isUnrecoverable = error instanceof UnrecoverableError;
 
       this.logger.error(
-        `Job [${jobId}] "${jobName}" failed on [${this.queueName}] ${isUnrecoverable ? '(PERMANENT - NO RETRY)' : '(RETRYING)'}: ${error.message}`,
+        `Job [${jobId}] "${jobName}" moved to failed state on [${this.queueName}] ${isUnrecoverable ? '(PERMANENT - NO RETRY)' : '(RETRYING)'}: ${error.message}`,
         {
           jobId,
           jobName,
@@ -143,10 +245,10 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
   }
 
   /**
-   * Returns whether the worker is currently running.
+   * Returns whether the worker is currently running and active.
    */
   public isRunning(): boolean {
-    return !!this.worker && this.worker.isRunning();
+    return !!this.worker && this.worker.isRunning() && !this.isShuttingDown;
   }
 
   /**
@@ -157,13 +259,37 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
   }
 
   /**
-   * Graceful shutdown hook.
+   * Performs safe graceful shutdown of the worker, waiting for active jobs to complete.
+   */
+  public async safeShutdown(timeoutMs = 10000): Promise<void> {
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
+
+    if (!this.worker) return;
+
+    this.logger.log(`Initiating safe shutdown for worker [${this.queueName}] (timeout: ${timeoutMs}ms)...`);
+
+    try {
+      // Pause worker first so it stops picking up new jobs from Redis
+      await this.worker.pause(true);
+
+      // Close worker gracefully, allowing in-flight jobs to finish
+      const closePromise = this.worker.close();
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Worker shutdown timed out after ${timeoutMs}ms`)), timeoutMs),
+      );
+
+      await Promise.race([closePromise, timeoutPromise]);
+      this.logger.log(`Worker for queue [${this.queueName}] shutdown cleanly.`);
+    } catch (error) {
+      this.logger.error(`Forced worker closure on [${this.queueName}] due to timeout/error: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Graceful shutdown hook for NestJS module lifecycle.
    */
   async onModuleDestroy(): Promise<void> {
-    if (this.worker) {
-      this.logger.log(`Closing worker for queue [${this.queueName}]...`);
-      await this.worker.close();
-      this.logger.log(`Worker for queue [${this.queueName}] stopped gracefully.`);
-    }
+    await this.safeShutdown();
   }
 }

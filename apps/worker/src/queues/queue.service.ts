@@ -21,6 +21,7 @@ export interface TypedEnqueueOptions extends JobsOptions {
 export class QueueService implements OnModuleDestroy {
   private readonly logger = new Logger({ service: 'worker', context: QueueService.name });
   private readonly queues = new Map<string, Queue>();
+  private isShuttingDown = false;
 
   constructor(private readonly redisService: RedisService) {}
 
@@ -72,7 +73,15 @@ export class QueueService implements OnModuleDestroy {
       enqueueOptions.backoff = options.retryPolicy.backoff;
     }
 
-    return this.addJob<JobPayloadMap[K]>(queueName, jobName, payload, enqueueOptions);
+    // Attach correlationId to payload if not already present
+    const payloadCorr = (payload as any)?.correlationId || (payload as any)?.deliveryId;
+    const correlationId = options?.correlationId || payloadCorr || `corr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const enrichedPayload = {
+      ...payload,
+      correlationId,
+    };
+
+    return this.addJob<JobPayloadMap[K]>(queueName, jobName, enrichedPayload, enqueueOptions);
   }
 
   /**
@@ -96,7 +105,13 @@ export class QueueService implements OnModuleDestroy {
       createdAt: new Date(job.timestamp || Date.now()),
     };
 
-    this.logger.log(`Job [${jobData.id}] "${name}" added to queue [${queueName}]`);
+    const correlationId = (payload as any)?.correlationId || job.opts?.jobId || jobData.id;
+    this.logger.log(`Job [${jobData.id}] "${name}" added to queue [${queueName}] (corr: ${correlationId})`, {
+      jobId: jobData.id,
+      jobName: name,
+      queue: queueName,
+      correlationId,
+    });
     return jobData;
   }
 
@@ -107,10 +122,36 @@ export class QueueService implements OnModuleDestroy {
     return Array.from(this.queues.keys());
   }
 
+  /**
+   * Safe graceful shutdown of all queues.
+   */
+  async safeShutdown(timeoutMs = 10000): Promise<void> {
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
+
+    this.logger.log(`Closing ${this.queues.size} BullMQ queue(s) gracefully...`);
+    const closePromises = Array.from(this.queues.values()).map(async (q) => {
+      try {
+        await q.close();
+      } catch (err) {
+        this.logger.warn(`Error closing queue ${q.name}: ${(err as Error).message}`);
+      }
+    });
+
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Queue closure timed out after ${timeoutMs}ms`)), timeoutMs),
+    );
+
+    try {
+      await Promise.race([Promise.all(closePromises), timeoutPromise]);
+      this.logger.log(`Closed ${this.queues.size} BullMQ queue(s) successfully`);
+    } catch (err) {
+      this.logger.error(`Queue shutdown timeout/error: ${(err as Error).message}`);
+    }
+  }
+
   /** Gracefully closes all managed queues on shutdown. */
   async onModuleDestroy() {
-    const closePromises = Array.from(this.queues.values()).map((q) => q.close());
-    await Promise.all(closePromises);
-    this.logger.log(`Closed ${this.queues.size} BullMQ queue(s)`);
+    await this.safeShutdown();
   }
 }
