@@ -1,8 +1,10 @@
 import { OnModuleDestroy } from '@nestjs/common';
-import { Worker, Job, WorkerOptions, ConnectionOptions } from 'bullmq';
+import { Worker, Job, WorkerOptions, ConnectionOptions, UnrecoverableError } from 'bullmq';
 import { Logger } from '@devpulse/logger';
 import { QueueName } from '@devpulse/types';
 import { RedisService } from '../redis/redis.service';
+import { resolveQueueConcurrency, DefaultQueueConfigs } from './queue.config';
+import { normalizeJobError, isRetryableError } from './job-errors';
 
 export interface BaseWorkerConfig {
   concurrency?: number;
@@ -14,7 +16,7 @@ export interface BaseWorkerConfig {
 
 /**
  * Abstract BaseWorker providing uniform lifecycle management, connection handling,
- * structured logging, error handling, and graceful shutdown for BullMQ workers.
+ * structured logging, error normalization (retryable vs permanent), and graceful shutdown.
  */
 export abstract class BaseWorker<DataType = any, ResultType = any> implements OnModuleDestroy {
   protected abstract readonly queueName: QueueName | string;
@@ -40,16 +42,44 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
     const connection: ConnectionOptions = this.redisService.client;
     const qName = this.queueName.toString();
 
+    // Resolves concurrency from workerConfig, env variables, or queue default
+    const concurrency =
+      this.workerConfig?.concurrency ??
+      resolveQueueConcurrency(this.queueName);
+
+    const limiter =
+      this.workerConfig?.limiter ??
+      DefaultQueueConfigs[qName]?.limiter;
+
     const options: WorkerOptions = {
       connection,
-      concurrency: this.workerConfig?.concurrency ?? 5,
-      limiter: this.workerConfig?.limiter,
+      concurrency,
+      limiter,
     };
 
     this.worker = new Worker<DataType, ResultType>(
       qName,
       async (job: Job<DataType, ResultType>) => {
-        return this.processJob(job);
+        try {
+          return await this.processJob(job);
+        } catch (rawError) {
+          // Normalize error: permanent failures become UnrecoverableError so BullMQ won't retry
+          const normalized = normalizeJobError(rawError);
+          const isRetryable = isRetryableError(rawError);
+
+          this.logger.warn(
+            `Job [${job.id}] "${job.name}" encountered ${isRetryable ? 'RETRYABLE' : 'PERMANENT'} failure on [${qName}]: ${normalized.message}`,
+            {
+              jobId: job.id,
+              jobName: job.name,
+              queue: qName,
+              attemptsMade: job.attemptsMade,
+              isRetryable,
+            },
+          );
+
+          throw normalized;
+        }
       },
       options,
     );
@@ -82,13 +112,19 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
     this.worker.on('failed', (job: Job<DataType, ResultType> | undefined, error: Error) => {
       const jobId = job?.id ?? 'unknown';
       const jobName = job?.name ?? 'unknown';
-      this.logger.error(`Job [${jobId}] "${jobName}" failed on [${this.queueName}]: ${error.message}`, {
-        jobId,
-        jobName,
-        queue: this.queueName,
-        error: error.message,
-        stack: error.stack,
-      });
+      const isUnrecoverable = error instanceof UnrecoverableError;
+
+      this.logger.error(
+        `Job [${jobId}] "${jobName}" failed on [${this.queueName}] ${isUnrecoverable ? '(PERMANENT - NO RETRY)' : '(RETRYING)'}: ${error.message}`,
+        {
+          jobId,
+          jobName,
+          queue: this.queueName,
+          error: error.message,
+          stack: error.stack,
+          isPermanent: isUnrecoverable,
+        },
+      );
     });
 
     this.worker.on('error', (err: Error) => {
