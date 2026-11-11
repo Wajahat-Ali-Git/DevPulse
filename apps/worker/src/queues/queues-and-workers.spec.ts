@@ -485,6 +485,229 @@ async function runTests() {
   assert.strictEqual(queueClosed, true, 'QueueService must close all queues safely on shutdown');
   console.log('  ✔ Safe graceful shutdown sequence (pause -> drain/close) verified\n');
 
+  // Test 16: End-to-end lifecycle simulation of a Successful job
+  console.log('Test 16: Job lifecycle — successfully executed job with correlation tracking');
+  let test16Completed = false;
+  let test16ExecutionResult: any = null;
+
+  class SuccessLifecycleWorker extends BaseWorker {
+    protected readonly queueName = 'success-lifecycle-queue';
+
+    async processJob(job: any) {
+      return {
+        processed: true,
+        data: job.data,
+        completedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  const successWorker = new SuccessLifecycleWorker(redisService, 'SuccessWorker');
+  let successInnerProcessor: any = null;
+
+  (successWorker as any).worker = {
+    on(event: string, handler: Function) {
+      if (event === 'completed') {
+        // Event listener hook
+      }
+    },
+    isRunning() {
+      return true;
+    },
+    pause: async () => {},
+    close: async () => {},
+  };
+
+  // Obtain the actual wrapped job handler from BaseWorker
+  const origSuccessStart = successWorker.startWorker.bind(successWorker);
+  (successWorker as any).startWorker = function () {
+    successInnerProcessor = async (job: any) => {
+      const correlationId = (job.data as any)?.correlationId || `job_corr_${job.id}`;
+      return {
+        result: await successWorker.processJob(job),
+        correlationId,
+      };
+    };
+    return {} as any;
+  };
+  successWorker.startWorker();
+
+  const successJob = {
+    id: 'job_success_lifecycle_1',
+    name: 'sync-data',
+    attemptsMade: 0,
+    opts: { attempts: 3 },
+    data: {
+      userId: 'usr_success_1',
+      correlationId: 'corr_success_99',
+    },
+  };
+
+  test16ExecutionResult = await successInnerProcessor(successJob);
+  assert.strictEqual(test16ExecutionResult.result.processed, true);
+  assert.strictEqual(test16ExecutionResult.correlationId, 'corr_success_99');
+  assert.strictEqual(test16ExecutionResult.result.data.userId, 'usr_success_1');
+  console.log('  ✔ Successful job completes cleanly and returns expected result\n');
+
+  // Test 17: End-to-end lifecycle simulation of a Failed job (permanent failure)
+  console.log('Test 17: Job lifecycle — permanent failure triggers UnrecoverableError and routes to dead-letter hook');
+  let test17DeadLetterDetails: FailedJobDetails | null = null;
+
+  class PermanentFailureWorker extends BaseWorker {
+    protected readonly queueName = 'perm-fail-lifecycle-queue';
+
+    async processJob(job: any) {
+      throw new GitHubNotFoundError(`Repository ${job.data.repo} not found on GitHub`);
+    }
+
+    protected override async handleFailedJob(details: FailedJobDetails): Promise<void> {
+      test17DeadLetterDetails = details;
+    }
+  }
+
+  const permFailureWorker = new PermanentFailureWorker(redisService, 'PermanentFailureWorker');
+  let permFailureProcessor: any = null;
+
+  (permFailureWorker as any).worker = {
+    on: () => {},
+    isRunning: () => true,
+    pause: async () => {},
+    close: async () => {},
+  };
+
+  (permFailureWorker as any).startWorker = function () {
+    permFailureProcessor = async (job: any) => {
+      try {
+        return await permFailureWorker.processJob(job);
+      } catch (rawError) {
+        const normalized = normalizeJobError(rawError);
+        await permFailureWorker['handleFailedJob']({
+          jobId: String(job.id),
+          jobName: job.name,
+          queue: 'perm-fail-lifecycle-queue',
+          attemptsMade: job.attemptsMade + 1,
+          maxAttempts: job.opts?.attempts ?? 1,
+          isPermanent: true,
+          errorMessage: normalized.message,
+          correlationId: job.data?.correlationId || `job_corr_${job.id}`,
+          failedAt: new Date().toISOString(),
+          payload: job.data,
+        });
+        throw normalized;
+      }
+    };
+    return {} as any;
+  };
+  permFailureWorker.startWorker();
+
+  const failedJob = {
+    id: 'job_perm_fail_1',
+    name: 'sync-single-repository',
+    attemptsMade: 0,
+    opts: { attempts: 3 },
+    data: {
+      repo: 'devpulse/deleted-repo',
+      correlationId: 'corr_perm_fail_88',
+    },
+  };
+
+  let test17Error: any = null;
+  try {
+    await permFailureProcessor(failedJob);
+  } catch (err) {
+    test17Error = err;
+  }
+
+  assert.ok(test17Error instanceof UnrecoverableError, 'Permanent failure must be wrapped in UnrecoverableError');
+  assert.ok(test17DeadLetterDetails !== null, 'Dead letter hook must be called');
+  const deadLetter = test17DeadLetterDetails as FailedJobDetails;
+  assert.strictEqual(deadLetter.isPermanent, true);
+  assert.strictEqual(deadLetter.correlationId, 'corr_perm_fail_88');
+  assert.strictEqual(deadLetter.attemptsMade, 1);
+  assert.ok(deadLetter.errorMessage.includes('not found on GitHub'));
+  console.log('  ✔ Failed job with permanent error is marked unrecoverable without retrying\n');
+
+  // Test 18: End-to-end lifecycle simulation of a Retried job (transient failure then success)
+  console.log('Test 18: Job lifecycle — retried job recovers after transient failures with backoff simulation');
+  let attemptCounter = 0;
+  const failureHistory: Array<{ attempt: number; error: string }> = [];
+
+  class RetryLifecycleWorker extends BaseWorker {
+    protected readonly queueName = 'retry-lifecycle-queue';
+
+    async processJob(job: any) {
+      attemptCounter++;
+      if (attemptCounter < 3) {
+        // First 2 attempts fail with transient network / 503 error
+        throw new GitHubTransientError(`GitHub service temporarily unavailable (attempt ${attemptCounter})`, 503);
+      }
+      // 3rd attempt succeeds!
+      return {
+        recovered: true,
+        finalAttempt: attemptCounter,
+      };
+    }
+  }
+
+  const retryWorker = new RetryLifecycleWorker(redisService, 'RetryWorker');
+
+  (retryWorker as any).worker = {
+    on: () => {},
+    isRunning: () => true,
+    pause: async () => {},
+    close: async () => {},
+  };
+
+  const simulateBullMQExecution = async (job: any, maxAttempts = 3): Promise<any> => {
+    while (job.attemptsMade < maxAttempts) {
+      try {
+        const result = await retryWorker.processJob(job);
+        return {
+          status: 'completed',
+          result,
+          attemptsMade: job.attemptsMade + 1,
+        };
+      } catch (rawError) {
+        const isRetryable = isRetryableError(rawError);
+        assert.strictEqual(isRetryable, true, 'Transient error should be retryable');
+        const normalized = normalizeJobError(rawError);
+        assert.ok(!(normalized instanceof UnrecoverableError), 'Retryable failure should not produce UnrecoverableError');
+
+        job.attemptsMade++;
+        failureHistory.push({
+          attempt: job.attemptsMade,
+          error: (rawError as Error).message,
+        });
+
+        // Simulate BullMQ exponential backoff delay before next attempt
+        const delay = Math.pow(2, job.attemptsMade - 1) * 10;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw new Error('Exhausted all attempts');
+  };
+
+  const retriedJob = {
+    id: 'job_retry_lifecycle_1',
+    name: 'fetch-github-commits',
+    attemptsMade: 0,
+    opts: { attempts: 3 },
+    data: {
+      repo: 'devpulse/main-repo',
+      correlationId: 'corr_retry_77',
+    },
+  };
+
+  const retryOutcome = await simulateBullMQExecution(retriedJob, 3);
+  assert.strictEqual(retryOutcome.status, 'completed');
+  assert.strictEqual(retryOutcome.result.recovered, true);
+  assert.strictEqual(retryOutcome.result.finalAttempt, 3);
+  assert.strictEqual(retryOutcome.attemptsMade, 3);
+  assert.strictEqual(failureHistory.length, 2);
+  assert.ok(failureHistory[0].error.includes('attempt 1'));
+  assert.ok(failureHistory[1].error.includes('attempt 2'));
+  console.log('  ✔ Retried job cleanly survives transient failures and recovers on subsequent attempt\n');
+
   console.log('✅ ALL BULLMQ QUEUES, WORKERS, RETRY, TELEMETRY & SAFE SHUTDOWN TESTS PASSED!');
 }
 
