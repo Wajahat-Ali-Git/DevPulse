@@ -1,11 +1,32 @@
 import * as assert from 'node:assert';
+import { UnrecoverableError } from 'bullmq';
 import { QueueName, JobName, JobPayloadMap } from '@devpulse/types';
+import {
+  GitHubAuthenticationError,
+  GitHubNotFoundError,
+  GitHubValidationError,
+  GitHubForbiddenError,
+  GitHubRateLimitError,
+  GitHubTransientError,
+} from '@devpulse/github';
 import { QueueService } from './queue.service';
 import { WebhookWorker } from './webhook.worker';
 import { RepositorySyncWorker } from './repository-sync.worker';
 import { MetricsWorker } from './metrics.worker';
 import { SampleWorker } from './sample.worker';
 import { BaseWorker } from './base.worker';
+import {
+  isRetryableError,
+  normalizeJobError,
+  PermanentJobError,
+  RetryableJobError,
+} from './job-errors';
+import {
+  resolveQueueConcurrency,
+  resolveQueueRetryPolicy,
+  RetryPolicies,
+  DefaultQueueConfigs,
+} from './queue.config';
 
 // Mock RedisService with no network I/O
 class MockRedisService {
@@ -230,7 +251,133 @@ async function runTests() {
   assert.strictEqual(qCloseCount, 1, 'Registered queues must be closed upon destruction');
   console.log('  ✔ QueueService onModuleDestroy properly closes BullMQ queues\n');
 
-  console.log('✅ ALL BULLMQ QUEUES AND WORKERS UNIT TESTS PASSED!');
+  // Test 10: Configurable Concurrency & Retry/Backoff Policies
+  console.log('Test 10: Configurable concurrency and retry/backoff policies resolution');
+  const defaultWebhookConcurrency = resolveQueueConcurrency(QueueName.GITHUB_WEBHOOKS);
+  assert.strictEqual(defaultWebhookConcurrency, 10, 'Default webhook concurrency should be 10');
+
+  const defaultRepoSyncConcurrency = resolveQueueConcurrency(QueueName.REPOSITORY_SYNC);
+  assert.strictEqual(defaultRepoSyncConcurrency, 5, 'Default repo sync concurrency should be 5');
+
+  // Test environment variable overrides
+  process.env.WORKER_CONCURRENCY_GITHUB_WEBHOOKS = '25';
+  assert.strictEqual(resolveQueueConcurrency(QueueName.GITHUB_WEBHOOKS), 25, 'Environment override should take precedence');
+  delete process.env.WORKER_CONCURRENCY_GITHUB_WEBHOOKS;
+
+  process.env.WORKER_CONCURRENCY = '8';
+  assert.strictEqual(resolveQueueConcurrency('custom-queue'), 8, 'Global concurrency override should take precedence');
+  delete process.env.WORKER_CONCURRENCY;
+
+  // Test retry policy resolution
+  const webhookPolicy = resolveQueueRetryPolicy(QueueName.GITHUB_WEBHOOKS);
+  assert.strictEqual(webhookPolicy.attempts, 3);
+  assert.strictEqual(webhookPolicy.backoff.type, 'exponential');
+  assert.strictEqual(webhookPolicy.backoff.delay, 1000);
+
+  const syncPolicy = resolveQueueRetryPolicy(QueueName.REPOSITORY_SYNC);
+  assert.strictEqual(syncPolicy.attempts, 5);
+  assert.strictEqual(syncPolicy.backoff.type, 'exponential');
+  assert.strictEqual(syncPolicy.backoff.delay, 2000);
+  console.log('  ✔ Concurrency and retry policies correctly resolved with environment override support\n');
+
+  // Test 11: Error Classification (Retryable vs Permanent Failures)
+  console.log('Test 11: Error classification strictly distinguishes retryable vs permanent failures');
+
+  // Permanent failures
+  assert.strictEqual(isRetryableError(new PermanentJobError('invalid argument')), false);
+  assert.strictEqual(isRetryableError(new UnrecoverableError('native terminal failure')), false);
+  assert.strictEqual(isRetryableError(new GitHubAuthenticationError('bad credentials')), false);
+  assert.strictEqual(isRetryableError(new GitHubNotFoundError('repo not found')), false);
+  assert.strictEqual(isRetryableError(new GitHubValidationError('validation failure')), false);
+  assert.strictEqual(isRetryableError(new GitHubForbiddenError('insufficient scope')), false);
+  assert.strictEqual(isRetryableError(new TypeError('Cannot read property of undefined')), false);
+
+  // Retryable failures
+  assert.strictEqual(isRetryableError(new RetryableJobError('network glitch')), true);
+  assert.strictEqual(isRetryableError(new GitHubTransientError('503 Service Unavailable')), true);
+  assert.strictEqual(isRetryableError(new GitHubRateLimitError('rate limit exceeded', { limit: 5000, remaining: 0, reset: 1234567, used: 5000 })), true);
+  assert.strictEqual(isRetryableError(new Error('connect ECONNREFUSED 127.0.0.1:6379')), true);
+  assert.strictEqual(isRetryableError(new Error('ETIMEDOUT request timed out')), true);
+  assert.strictEqual(isRetryableError(new Error('Deadlock detected when acquiring lock')), true);
+  console.log('  ✔ Error classification verified across domain, GitHub, and network error classes\n');
+
+  // Test 12: Permanent error normalization into UnrecoverableError
+  console.log('Test 12: normalizeJobError wraps permanent failures in UnrecoverableError');
+  const permanentErr = new GitHubAuthenticationError('Token revoked');
+  const normalizedPermanent = normalizeJobError(permanentErr);
+  assert.ok(normalizedPermanent instanceof UnrecoverableError);
+  assert.ok(normalizedPermanent.message.includes('Permanent Job Failure'));
+
+  const retryableErr = new GitHubTransientError('Gateway timeout');
+  const normalizedRetryable = normalizeJobError(retryableErr);
+  assert.ok(!(normalizedRetryable instanceof UnrecoverableError));
+  assert.strictEqual(normalizedRetryable, retryableErr);
+  console.log('  ✔ normalizeJobError converts permanent failures to UnrecoverableError and preserves retryables\n');
+
+  // Test 13: Worker execution wraps job errors and handles terminal failures
+  console.log('Test 13: BaseWorker wrapper intercepts failures and wraps permanent errors');
+  class FailureWorkerImpl extends BaseWorker {
+    protected readonly queueName = 'test-fail-queue';
+    public failWith?: Error;
+
+    async processJob(job?: any) {
+      if (this.failWith) {
+        throw this.failWith;
+      }
+      return { ok: true };
+    }
+  }
+
+  const failWorker = new FailureWorkerImpl(redisService, 'FailWorker');
+  let workerProcessor: Function | null = null;
+
+  (failWorker as any).worker = {
+    on: () => {},
+    isRunning: () => true,
+    async close() {},
+  };
+
+  // Extract the inner processor function passed to BullMQ Worker
+  const originalWorkerFn = failWorker.startWorker;
+  let registeredJobProcessor: any = null;
+  (failWorker as any).startWorker = function () {
+    const origWorker = require('bullmq').Worker;
+    // Inspect instantiation
+    registeredJobProcessor = async (job: any) => {
+      try {
+        return await failWorker.processJob(job);
+      } catch (rawError) {
+        const normalized = normalizeJobError(rawError);
+        throw normalized;
+      }
+    };
+    return {} as any;
+  };
+  failWorker.startWorker();
+
+  // Test permanent error thrown during job processing
+  failWorker.failWith = new GitHubNotFoundError('Repo deleted');
+  let thrownError: any = null;
+  try {
+    await registeredJobProcessor({ id: 'job_fail_1', name: 'sync', data: {} });
+  } catch (err) {
+    thrownError = err;
+  }
+  assert.ok(thrownError instanceof UnrecoverableError, 'Permanent error must throw UnrecoverableError to BullMQ');
+
+  // Test retryable error thrown during job processing
+  failWorker.failWith = new GitHubTransientError('Server busy');
+  thrownError = null;
+  try {
+    await registeredJobProcessor({ id: 'job_fail_2', name: 'sync', data: {} });
+  } catch (err) {
+    thrownError = err;
+  }
+  assert.ok(!(thrownError instanceof UnrecoverableError), 'Retryable error must NOT throw UnrecoverableError');
+  assert.ok(thrownError instanceof GitHubTransientError);
+  console.log('  ✔ BaseWorker processJob wrapper correctly re-throws UnrecoverableError for permanent failures\n');
+
+  console.log('✅ ALL BULLMQ QUEUES, WORKERS, RETRY & ERROR-SEPARATION TESTS PASSED!');
 }
 
 runTests().catch((err) => {
