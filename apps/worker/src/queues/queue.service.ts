@@ -4,9 +4,11 @@ import { Logger } from '@devpulse/logger';
 import { QueueName, JobName, JobPayloadMap } from '@devpulse/types';
 import { RedisService } from '../redis/redis.service';
 import { JobData } from '../jobs/job.interface';
+import { resolveQueueRetryPolicy, RetryPolicy } from './queue.config';
 
 export interface TypedEnqueueOptions extends JobsOptions {
   correlationId?: string;
+  retryPolicy?: RetryPolicy;
 }
 
 /**
@@ -24,20 +26,19 @@ export class QueueService implements OnModuleDestroy {
 
   /**
    * Returns an existing BullMQ Queue or creates a new one for the given name.
-   * All queues share the same Redis connection options.
+   * All queues share the same Redis connection options and apply resolved retry/backoff policies.
    */
   public getOrCreateQueue(queueName: string | QueueName): Queue {
     const qName = queueName.toString();
     if (!this.queues.has(qName)) {
       const connection: ConnectionOptions = this.redisService.client;
+      const retryPolicy = resolveQueueRetryPolicy(qName);
+
       const queue = new Queue(qName, {
         connection,
         defaultJobOptions: {
-          attempts: 3,
-          backoff: {
-            type: 'exponential',
-            delay: 1000,
-          },
+          attempts: retryPolicy.attempts,
+          backoff: retryPolicy.backoff,
           removeOnComplete: {
             count: 1000,
             age: 24 * 3600,
@@ -49,7 +50,9 @@ export class QueueService implements OnModuleDestroy {
         },
       });
       this.queues.set(qName, queue);
-      this.logger.log(`BullMQ queue registered: [${qName}]`);
+      this.logger.log(
+        `BullMQ queue registered: [${qName}] (attempts: ${retryPolicy.attempts}, backoff: ${retryPolicy.backoff.type}/${retryPolicy.backoff.delay}ms)`,
+      );
     }
     return this.queues.get(qName)!;
   }
@@ -63,7 +66,13 @@ export class QueueService implements OnModuleDestroy {
     payload: JobPayloadMap[K],
     options?: TypedEnqueueOptions,
   ): Promise<JobData<JobPayloadMap[K]>> {
-    return this.addJob<JobPayloadMap[K]>(queueName, jobName, payload, options);
+    const enqueueOptions: JobsOptions = { ...options };
+    if (options?.retryPolicy) {
+      enqueueOptions.attempts = options.retryPolicy.attempts;
+      enqueueOptions.backoff = options.retryPolicy.backoff;
+    }
+
+    return this.addJob<JobPayloadMap[K]>(queueName, jobName, payload, enqueueOptions);
   }
 
   /**
