@@ -48,3 +48,21 @@ export interface PaginatedRepositoriesResponse<T> {
     hasPrevPage: boolean;
   };
 }
+
+export interface InitiateSyncRequestDto {
+  githubAccountId?: string;
+  workspaceId: string;
+  forced?: boolean;
+}
+
+export interface InitiateSyncResponseDto {
+  jobId: string;
+  queueName: string;
+  jobName: string;
+  status: 'enqueued';
+  initiatedAt: string;
+  githubAccountId: string;
+  workspaceId: string;
+  userId: string;
+}
+

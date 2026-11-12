@@ -1,8 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Queue, ConnectionOptions } from 'bullmq';
 import { DatabaseService } from '../database.service';
+import { RedisService } from '../redis.service';
 import { GitHubClient, GitHubNotFoundError, GitHubForbiddenError, GitHubRepository } from '@devpulse/github';
 import { RepositoryStatus } from '@devpulse/database';
 import { Logger } from '@devpulse/logger';
+import { QueueName, JobName, SyncUserRepositoriesPayload } from '@devpulse/types';
 import { ResourceNotFoundException, AuthorizationException } from '../common/errors';
 import {
   SyncRepositoryResult,
@@ -10,16 +13,129 @@ import {
   SyncExecutionRecord,
   ListRepositoriesFilter,
   PaginatedRepositoriesResponse,
+  InitiateSyncRequestDto,
+  InitiateSyncResponseDto,
 } from './types';
 
 @Injectable()
-export class RepositorySyncService {
+export class RepositorySyncService implements OnModuleDestroy {
   private readonly logger = new Logger({ service: 'api', context: RepositorySyncService.name });
 
   // In-memory sync telemetry tracking last successful sync timestamp and error per repository
   private readonly syncStateMap = new Map<string, { lastSyncedAt?: Date; lastSyncError?: string | null }>();
 
-  constructor(private readonly databaseService: DatabaseService) {}
+  // Lazily initialized BullMQ queue for repository synchronization
+  private syncQueue?: Queue;
+
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly redisService?: RedisService,
+  ) {}
+
+  /**
+   * Returns or lazily creates the BullMQ queue for repository synchronization.
+   */
+  private getSyncQueue(): Queue {
+    if (!this.syncQueue) {
+      const connection: ConnectionOptions = this.redisService?.client as any;
+      this.syncQueue = new Queue(QueueName.REPOSITORY_SYNC, {
+        connection,
+      });
+    }
+    return this.syncQueue;
+  }
+
+  /**
+   * Enqueues an asynchronous repository synchronization job.
+   * Validates that the requested GitHub account exists and belongs to the authenticated user.
+   * Also verifies user workspace membership.
+   */
+  async enqueueRepositorySync(
+    userId: string,
+    dto: InitiateSyncRequestDto,
+  ): Promise<InitiateSyncResponseDto> {
+    const prisma = this.databaseService.client;
+
+    // 1. Enforce user-level data isolation on workspace
+    await this.verifyUserWorkspaceAccess(userId, dto.workspaceId);
+
+    // 2. Validate that the requested GitHub account belongs to the authenticated user
+    let gitHubAccount;
+    if (dto.githubAccountId) {
+      gitHubAccount = await prisma.gitHubAccount.findFirst({
+        where: {
+          id: dto.githubAccountId,
+        },
+      });
+
+      if (!gitHubAccount) {
+        throw new ResourceNotFoundException('Requested GitHub account was not found');
+      }
+
+      if (gitHubAccount.userId !== userId) {
+        this.logger.warn(
+          `User ${userId} attempted to initiate sync with foreign GitHub account ${dto.githubAccountId} owned by ${gitHubAccount.userId}`,
+        );
+        throw new AuthorizationException(
+          'The requested GitHub account does not belong to the authenticated user',
+        );
+      }
+    } else {
+      // Find the user's primary linked GitHub account
+      gitHubAccount = await prisma.gitHubAccount.findFirst({
+        where: {
+          userId,
+        },
+      });
+
+      if (!gitHubAccount) {
+        throw new ResourceNotFoundException(
+          'No linked GitHub account found for the authenticated user. Please connect a GitHub account first.',
+        );
+      }
+    }
+
+    // 3. Construct job payload
+    const payload: SyncUserRepositoriesPayload = {
+      userId,
+      workspaceId: dto.workspaceId,
+      forced: dto.forced ?? false,
+    };
+
+    // 4. Enqueue to BullMQ
+    const queue = this.getSyncQueue();
+    const job = await queue.add(JobName.SYNC_USER_REPOSITORIES, payload);
+
+    const initiatedAt = new Date().toISOString();
+    this.logger.info(
+      `Enqueued repository sync job [${job.id}] for user ${userId} (account: ${gitHubAccount.username}, workspace: ${dto.workspaceId})`,
+      {
+        jobId: job.id,
+        userId,
+        workspaceId: dto.workspaceId,
+        githubAccountId: gitHubAccount.id,
+        username: gitHubAccount.username,
+      },
+    );
+
+    return {
+      jobId: String(job.id),
+      queueName: QueueName.REPOSITORY_SYNC,
+      jobName: JobName.SYNC_USER_REPOSITORIES,
+      status: 'enqueued',
+      initiatedAt,
+      githubAccountId: gitHubAccount.id,
+      workspaceId: dto.workspaceId,
+      userId,
+    };
+  }
+
+  async onModuleDestroy() {
+    if (this.syncQueue) {
+      await this.syncQueue.close();
+    }
+  }
+
 
   /**
    * Enforces user-level data isolation.
