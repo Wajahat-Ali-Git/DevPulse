@@ -2,6 +2,7 @@ import {
   Controller,
   Post,
   Get,
+  Param,
   Body,
   Query,
   HttpCode,
@@ -12,7 +13,7 @@ import { CurrentUser } from '../auth/decorators';
 import { AuthTokenPayload } from '@devpulse/types';
 import { RepositorySyncService } from './repository-sync.service';
 import { InitiateSyncDto } from './dto/initiate-sync.dto';
-import { InitiateSyncResponseDto } from './types';
+import { InitiateSyncResponseDto, SyncJobStatusResponseDto } from './types';
 
 @Controller('repositories')
 export class RepositoriesController {
@@ -32,6 +33,19 @@ export class RepositoriesController {
     @Body() dto: InitiateSyncDto,
   ): Promise<InitiateSyncResponseDto> {
     return this.repositorySyncService.enqueueRepositorySync(user.sub, dto);
+  }
+
+  /**
+   * Retrieves status and tracking metadata for an enqueued repository synchronization job.
+   *
+   * GET /api/v1/repositories/sync/status/:jobId
+   */
+  @Get('sync/status/:jobId')
+  async getSyncStatus(
+    @CurrentUser() user: AuthTokenPayload,
+    @Param('jobId') jobId: string,
+  ): Promise<SyncJobStatusResponseDto> {
+    return this.repositorySyncService.getSyncJobStatus(jobId);
   }
 
   /**
@@ -57,3 +71,4 @@ export class RepositoriesController {
     });
   }
 }
+

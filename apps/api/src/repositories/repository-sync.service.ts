@@ -15,6 +15,7 @@ import {
   PaginatedRepositoriesResponse,
   InitiateSyncRequestDto,
   InitiateSyncResponseDto,
+  SyncJobStatusResponseDto,
 } from './types';
 
 @Injectable()
@@ -95,31 +96,38 @@ export class RepositorySyncService implements OnModuleDestroy {
       }
     }
 
-    // 3. Construct job payload
-    const payload: SyncUserRepositoriesPayload = {
+    // 3. Construct job payload and correlation tracking
+    const correlationId = `sync_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const payload: SyncUserRepositoriesPayload & { correlationId: string } = {
       userId,
       workspaceId: dto.workspaceId,
       forced: dto.forced ?? false,
+      correlationId,
     };
 
     // 4. Enqueue to BullMQ
     const queue = this.getSyncQueue();
-    const job = await queue.add(JobName.SYNC_USER_REPOSITORIES, payload);
+    const job = await queue.add(JobName.SYNC_USER_REPOSITORIES, payload, {
+      jobId: correlationId,
+    });
 
     const initiatedAt = new Date().toISOString();
+    const jobIdStr = String(job.id);
+
     this.logger.info(
-      `Enqueued repository sync job [${job.id}] for user ${userId} (account: ${gitHubAccount.username}, workspace: ${dto.workspaceId})`,
+      `Enqueued repository sync job [${jobIdStr}] for user ${userId} (account: ${gitHubAccount.username}, workspace: ${dto.workspaceId}, corr: ${correlationId})`,
       {
-        jobId: job.id,
+        jobId: jobIdStr,
         userId,
         workspaceId: dto.workspaceId,
         githubAccountId: gitHubAccount.id,
         username: gitHubAccount.username,
+        correlationId,
       },
     );
 
     return {
-      jobId: String(job.id),
+      jobId: jobIdStr,
       queueName: QueueName.REPOSITORY_SYNC,
       jobName: JobName.SYNC_USER_REPOSITORIES,
       status: 'enqueued',
@@ -127,6 +135,42 @@ export class RepositorySyncService implements OnModuleDestroy {
       githubAccountId: gitHubAccount.id,
       workspaceId: dto.workspaceId,
       userId,
+      tracking: {
+        checkStatusUrl: `/api/v1/repositories/sync/status/${jobIdStr}`,
+        correlationId,
+        pollingIntervalMs: 2000,
+        estimatedTimeoutMs: 120000,
+      },
+    };
+  }
+
+  /**
+   * Retrieves tracking and status information for an enqueued synchronization job.
+   */
+  async getSyncJobStatus(jobId: string): Promise<SyncJobStatusResponseDto> {
+    const queue = this.getSyncQueue();
+    const job = await queue.getJob(jobId);
+
+    if (!job) {
+      throw new ResourceNotFoundException(`Synchronization job with ID ${jobId} not found`);
+    }
+
+    const state = await job.getState();
+    const attemptsMade = job.attemptsMade ?? 0;
+    const progress = typeof job.progress === 'number' ? job.progress : undefined;
+
+    return {
+      jobId: String(job.id),
+      queueName: QueueName.REPOSITORY_SYNC,
+      jobName: job.name,
+      status: state as any,
+      progress,
+      result: job.returnvalue,
+      error: job.failedReason ?? null,
+      attemptsMade,
+      createdAt: job.timestamp ? new Date(job.timestamp).toISOString() : undefined,
+      processedAt: job.processedOn ? new Date(job.processedOn).toISOString() : undefined,
+      finishedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : undefined,
     };
   }
 

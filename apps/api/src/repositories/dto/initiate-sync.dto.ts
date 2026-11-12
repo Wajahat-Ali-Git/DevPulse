@@ -13,3 +13,4 @@ export class InitiateSyncDto {
   @IsOptional()
   forced?: boolean;
 }
+

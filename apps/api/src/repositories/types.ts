@@ -64,5 +64,26 @@ export interface InitiateSyncResponseDto {
   githubAccountId: string;
   workspaceId: string;
   userId: string;
+  tracking: {
+    checkStatusUrl: string;
+    correlationId: string;
+    pollingIntervalMs: number;
+    estimatedTimeoutMs: number;
+  };
 }
+
+export interface SyncJobStatusResponseDto {
+  jobId: string;
+  queueName: string;
+  jobName: string;
+  status: 'waiting' | 'active' | 'completed' | 'failed' | 'delayed' | 'unknown';
+  progress?: number;
+  result?: any;
+  error?: string | null;
+  attemptsMade: number;
+  createdAt?: string;
+  processedAt?: string;
+  finishedAt?: string;
+}
+
 
