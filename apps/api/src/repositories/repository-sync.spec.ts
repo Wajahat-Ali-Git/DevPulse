@@ -613,7 +613,7 @@ async function runTests() {
     assert.strictEqual(response.workspaceId, 'ws-test');
     assert.strictEqual(response.userId, 'user-alice');
     assert.ok(response.tracking);
-    assert.strictEqual(response.tracking.checkStatusUrl, '/api/v1/repositories/sync/status/bullmq-job-101');
+    assert.strictEqual(response.tracking.checkStatusUrl, '/api/v1/sync/bullmq-job-101');
     assert.ok(response.tracking.correlationId);
     assert.strictEqual(response.tracking.pollingIntervalMs, 2000);
     assert.strictEqual(enqueuedJobName, 'sync-user-repositories');
@@ -770,6 +770,7 @@ async function runTests() {
     const user = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
 
     const statusRes = await controller.getSyncStatus(user as any, 'job-123');
+    assert.strictEqual(statusRes.syncId, 'job-123');
     assert.strictEqual(statusRes.jobId, 'job-123');
     assert.strictEqual(statusRes.status, 'completed');
     assert.strictEqual(statusRes.progress, 50);
@@ -789,6 +790,105 @@ async function runTests() {
     assert.ok(notFoundErr !== null);
     assert.strictEqual(notFoundErr.getStatus(), 404);
     console.log('  ✔ Sync job status tracking returns complete state and handles 404\n');
+  }
+
+  // Test 20: SyncController endpoints: POST /api/v1/sync/repositories, GET /api/v1/sync/:syncId, GET /api/v1/sync/history
+  {
+    console.log('Test 20: SyncController endpoints (POST /sync/repositories, GET /sync/:syncId, GET /sync/history)');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push(
+      { workspaceId: 'ws-1', userId: 'user-alice', role: 'MEMBER' },
+      { workspaceId: 'ws-2', userId: 'user-alice', role: 'MEMBER' },
+      { workspaceId: 'ws-3', userId: 'user-bob', role: 'MEMBER' },
+    );
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-alice',
+      userId: 'user-alice',
+      username: 'alice',
+      accessToken: 'token-alice',
+    });
+
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    let enqueuedPayload: any = null;
+    const mockJobsMap = new Map<string, any>();
+
+    (service as any).syncQueue = {
+      add: async (name: string, payload: any, opts: any) => {
+        enqueuedPayload = payload;
+        const jobId = opts.jobId || 'job-sync-test';
+        const jobRecord = {
+          id: jobId,
+          name,
+          data: payload,
+          attemptsMade: 1,
+          progress: 100,
+          returnvalue: { syncedCount: 5 },
+          failedReason: null,
+          timestamp: Date.now() - 2000,
+          processedOn: Date.now() - 1000,
+          finishedOn: Date.now(),
+          getState: async () => 'completed',
+        };
+        mockJobsMap.set(jobId, jobRecord);
+        return jobRecord;
+      },
+      getJob: async (id: string) => mockJobsMap.get(id) || null,
+    };
+
+    const { SyncController } = require('./sync.controller');
+    const syncController = new SyncController(service);
+    const alice = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+    const bob = { sub: 'user-bob', email: 'bob@example.com', role: 'MEMBER' };
+
+    // 1. POST /api/v1/sync/repositories
+    const initRes = await syncController.initiateRepositoriesSync(alice as any, {
+      workspaceId: 'ws-1',
+      githubAccountId: 'gh-alice',
+    });
+    assert.strictEqual(initRes.status, 'enqueued');
+    assert.strictEqual(initRes.workspaceId, 'ws-1');
+    assert.strictEqual(initRes.userId, 'user-alice');
+    assert.ok(initRes.syncId);
+    assert.strictEqual(initRes.syncId, initRes.jobId);
+    assert.strictEqual(initRes.tracking.checkStatusUrl, `/api/v1/sync/${initRes.jobId}`);
+
+    // 2. GET /api/v1/sync/:syncId
+    const statusRes = await syncController.getSyncStatus(alice as any, initRes.syncId);
+    assert.strictEqual(statusRes.syncId, initRes.syncId);
+    assert.strictEqual(statusRes.jobId, initRes.jobId);
+    assert.strictEqual(statusRes.status, 'completed');
+    assert.strictEqual(statusRes.progress, 100);
+    assert.strictEqual(statusRes.result.syncedCount, 5);
+
+    // 3. GET /api/v1/sync/history (Alice sees her workspaces ws-1 and ws-2, but not Bob's ws-3)
+    const historyAlice = await syncController.getSyncHistory(alice as any);
+    assert.ok(Array.isArray(historyAlice));
+    assert.ok(historyAlice.length >= 1);
+    assert.strictEqual(historyAlice[0].syncId, initRes.syncId);
+    assert.strictEqual(historyAlice[0].workspaceId, 'ws-1');
+    assert.strictEqual(historyAlice[0].status, 'completed');
+
+    // Bob cannot see Alice's workspace ws-1 sync history
+    const historyBob = await syncController.getSyncHistory(bob as any);
+    assert.strictEqual(historyBob.length, 0);
+
+    // Specific workspace history filter
+    const historyWs1 = await syncController.getSyncHistory(alice as any, 'ws-1');
+    assert.strictEqual(historyWs1.length, 1);
+    assert.strictEqual(historyWs1[0].workspaceId, 'ws-1');
+
+    // Alice attempting to query sync history of ws-3 (Bob's workspace) throws 403
+    let forbiddenErr: any = null;
+    try {
+      await syncController.getSyncHistory(alice as any, 'ws-3');
+    } catch (err) {
+      forbiddenErr = err;
+    }
+    assert.ok(forbiddenErr !== null);
+    assert.strictEqual(forbiddenErr.getStatus(), 403);
+
+    console.log('  ✔ POST /sync/repositories, GET /sync/:syncId, and GET /sync/history work with multi-tenant isolation\n');
   }
 
   console.log('✅ ALL REPOSITORY SYNC, ISOLATION & TELEMETRY TESTS PASSED!\n');
