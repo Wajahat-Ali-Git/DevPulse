@@ -56,6 +56,7 @@ export interface InitiateSyncRequestDto {
 }
 
 export interface InitiateSyncResponseDto {
+  syncId: string;
   jobId: string;
   queueName: string;
   jobName: string;
@@ -73,6 +74,7 @@ export interface InitiateSyncResponseDto {
 }
 
 export interface SyncJobStatusResponseDto {
+  syncId: string;
   jobId: string;
   queueName: string;
   jobName: string;
@@ -81,9 +83,34 @@ export interface SyncJobStatusResponseDto {
   result?: any;
   error?: string | null;
   attemptsMade: number;
+  userId?: string;
+  workspaceId?: string;
   createdAt?: string;
   processedAt?: string;
   finishedAt?: string;
 }
+
+export interface SyncHistoryFilter {
+  workspaceId?: string;
+  limit?: number;
+  status?: string;
+}
+
+export interface SyncHistoryItemDto {
+  syncId: string;
+  jobId: string;
+  jobName: string;
+  queueName: string;
+  status: string;
+  workspaceId: string;
+  userId: string;
+  enqueuedAt: string;
+  processedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+  error?: string | null;
+  result?: any;
+}
+
 
 

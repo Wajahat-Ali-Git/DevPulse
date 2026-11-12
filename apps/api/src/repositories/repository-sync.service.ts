@@ -16,6 +16,8 @@ import {
   InitiateSyncRequestDto,
   InitiateSyncResponseDto,
   SyncJobStatusResponseDto,
+  SyncHistoryFilter,
+  SyncHistoryItemDto,
 } from './types';
 
 @Injectable()
@@ -24,6 +26,9 @@ export class RepositorySyncService implements OnModuleDestroy {
 
   // In-memory sync telemetry tracking last successful sync timestamp and error per repository
   private readonly syncStateMap = new Map<string, { lastSyncedAt?: Date; lastSyncError?: string | null }>();
+
+  // In-memory sync history tracking recent repository synchronization jobs
+  private readonly syncHistory: SyncHistoryItemDto[] = [];
 
   // Lazily initialized BullMQ queue for repository synchronization
   private syncQueue?: Queue;
@@ -126,7 +131,20 @@ export class RepositorySyncService implements OnModuleDestroy {
       },
     );
 
+    // Record into sync history
+    this.recordSyncHistory({
+      syncId: jobIdStr,
+      jobId: jobIdStr,
+      jobName: JobName.SYNC_USER_REPOSITORIES,
+      queueName: QueueName.REPOSITORY_SYNC,
+      status: 'enqueued',
+      workspaceId: dto.workspaceId,
+      userId,
+      enqueuedAt: initiatedAt,
+    });
+
     return {
+      syncId: jobIdStr,
       jobId: jobIdStr,
       queueName: QueueName.REPOSITORY_SYNC,
       jobName: JobName.SYNC_USER_REPOSITORIES,
@@ -136,7 +154,7 @@ export class RepositorySyncService implements OnModuleDestroy {
       workspaceId: dto.workspaceId,
       userId,
       tracking: {
-        checkStatusUrl: `/api/v1/repositories/sync/status/${jobIdStr}`,
+        checkStatusUrl: `/api/v1/sync/${jobIdStr}`,
         correlationId,
         pollingIntervalMs: 2000,
         estimatedTimeoutMs: 120000,
@@ -147,20 +165,41 @@ export class RepositorySyncService implements OnModuleDestroy {
   /**
    * Retrieves tracking and status information for an enqueued synchronization job.
    */
-  async getSyncJobStatus(jobId: string): Promise<SyncJobStatusResponseDto> {
+  async getSyncJobStatus(syncOrJobId: string): Promise<SyncJobStatusResponseDto> {
     const queue = this.getSyncQueue();
-    const job = await queue.getJob(jobId);
+    const job = await queue.getJob(syncOrJobId);
 
     if (!job) {
-      throw new ResourceNotFoundException(`Synchronization job with ID ${jobId} not found`);
+      throw new ResourceNotFoundException(`Synchronization job with ID ${syncOrJobId} not found`);
     }
 
     const state = await job.getState();
     const attemptsMade = job.attemptsMade ?? 0;
     const progress = typeof job.progress === 'number' ? job.progress : undefined;
+    const jobIdStr = String(job.id);
+    const userId = job.data?.userId;
+    const workspaceId = job.data?.workspaceId;
+
+    const createdAt = job.timestamp ? new Date(job.timestamp).toISOString() : undefined;
+    const processedAt = job.processedOn ? new Date(job.processedOn).toISOString() : undefined;
+    const finishedAt = job.finishedOn ? new Date(job.finishedOn).toISOString() : undefined;
+
+    // Update history entry if present
+    const existing = this.syncHistory.find((h) => h.syncId === jobIdStr || h.jobId === jobIdStr);
+    if (existing) {
+      existing.status = state;
+      existing.processedAt = processedAt;
+      existing.finishedAt = finishedAt;
+      if (job.finishedOn && job.processedOn) {
+        existing.durationMs = job.finishedOn - job.processedOn;
+      }
+      existing.error = job.failedReason ?? null;
+      existing.result = job.returnvalue;
+    }
 
     return {
-      jobId: String(job.id),
+      syncId: jobIdStr,
+      jobId: jobIdStr,
       queueName: QueueName.REPOSITORY_SYNC,
       jobName: job.name,
       status: state as any,
@@ -168,10 +207,64 @@ export class RepositorySyncService implements OnModuleDestroy {
       result: job.returnvalue,
       error: job.failedReason ?? null,
       attemptsMade,
-      createdAt: job.timestamp ? new Date(job.timestamp).toISOString() : undefined,
-      processedAt: job.processedOn ? new Date(job.processedOn).toISOString() : undefined,
-      finishedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : undefined,
+      userId,
+      workspaceId,
+      createdAt,
+      processedAt,
+      finishedAt,
     };
+  }
+
+  /**
+   * Records or updates a sync item in the in-memory sync history.
+   */
+  recordSyncHistory(item: SyncHistoryItemDto): void {
+    const index = this.syncHistory.findIndex((h) => h.syncId === item.syncId || h.jobId === item.jobId);
+    if (index >= 0) {
+      this.syncHistory[index] = { ...this.syncHistory[index], ...item };
+    } else {
+      // Keep most recent items at the front, cap history buffer at 500
+      this.syncHistory.unshift(item);
+      if (this.syncHistory.length > 500) {
+        this.syncHistory.pop();
+      }
+    }
+  }
+
+  /**
+   * Retrieves synchronization history filtered by authorized workspaces and options.
+   */
+  async getSyncHistory(
+    userId: string,
+    filter: SyncHistoryFilter = {},
+  ): Promise<SyncHistoryItemDto[]> {
+    const prisma = this.databaseService.client;
+
+    let allowedWorkspaceIds: string[];
+    if (filter.workspaceId) {
+      await this.verifyUserWorkspaceAccess(userId, filter.workspaceId);
+      allowedWorkspaceIds = [filter.workspaceId];
+    } else {
+      const memberships = await prisma.workspaceMember.findMany({
+        where: { userId },
+        select: { workspaceId: true },
+      });
+      allowedWorkspaceIds = memberships.map((m: { workspaceId: string }) => m.workspaceId);
+    }
+
+    const limit = Math.min(Math.max(filter.limit ?? 20, 1), 100);
+
+    return this.syncHistory
+      .filter((item) => {
+        if (!allowedWorkspaceIds.includes(item.workspaceId)) {
+          return false;
+        }
+        if (filter.status && item.status.toLowerCase() !== filter.status.toLowerCase()) {
+          return false;
+        }
+        return true;
+      })
+      .slice(0, limit);
   }
 
   async onModuleDestroy() {
