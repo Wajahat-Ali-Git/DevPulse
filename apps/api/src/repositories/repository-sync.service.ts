@@ -2,6 +2,7 @@ import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { Queue, ConnectionOptions } from 'bullmq';
 import { DatabaseService } from '../database.service';
 import { RedisService } from '../redis.service';
+import { RepositorySyncQueueService } from './repository-sync-queue.service';
 import { GitHubClient, GitHubNotFoundError, GitHubForbiddenError, GitHubRepository } from '@devpulse/github';
 import { RepositoryStatus } from '@devpulse/database';
 import { Logger } from '@devpulse/logger';
@@ -36,14 +37,18 @@ export class RepositorySyncService implements OnModuleDestroy {
   constructor(
     private readonly databaseService: DatabaseService,
     private readonly redisService?: RedisService,
+    private readonly syncQueueService?: RepositorySyncQueueService,
   ) {}
 
   /**
    * Returns or lazily creates the BullMQ queue for repository synchronization.
    */
   private getSyncQueue(): Queue {
+    if (this.syncQueueService) {
+      return this.syncQueueService.getQueue();
+    }
     if (!this.syncQueue) {
-      const connection: ConnectionOptions = this.redisService?.client as any;
+      const connection = this.redisService?.client as any;
       this.syncQueue = new Queue(QueueName.REPOSITORY_SYNC, {
         connection,
       });
@@ -110,11 +115,19 @@ export class RepositorySyncService implements OnModuleDestroy {
       correlationId,
     };
 
-    // 4. Enqueue to BullMQ
-    const queue = this.getSyncQueue();
-    const job = await queue.add(JobName.SYNC_USER_REPOSITORIES, payload, {
-      jobId: correlationId,
-    });
+    // 4. Enqueue via dedicated RepositorySyncQueueService or fallback queue
+    let job: any;
+    if (this.syncQueueService) {
+      job = await this.syncQueueService.addSyncUserRepositoriesJob(payload, {
+        jobId: correlationId,
+        correlationId,
+      });
+    } else {
+      const queue = this.getSyncQueue();
+      job = await queue.add(JobName.SYNC_USER_REPOSITORIES, payload, {
+        jobId: correlationId,
+      });
+    }
 
     const initiatedAt = new Date().toISOString();
     const jobIdStr = String(job.id);
