@@ -612,11 +612,15 @@ async function runTests() {
     assert.strictEqual(response.githubAccountId, 'gh-acc-1');
     assert.strictEqual(response.workspaceId, 'ws-test');
     assert.strictEqual(response.userId, 'user-alice');
+    assert.ok(response.tracking);
+    assert.strictEqual(response.tracking.checkStatusUrl, '/api/v1/repositories/sync/status/bullmq-job-101');
+    assert.ok(response.tracking.correlationId);
+    assert.strictEqual(response.tracking.pollingIntervalMs, 2000);
     assert.strictEqual(enqueuedJobName, 'sync-user-repositories');
     assert.strictEqual(enqueuedPayload.userId, 'user-alice');
     assert.strictEqual(enqueuedPayload.workspaceId, 'ws-test');
     assert.strictEqual(enqueuedPayload.forced, true);
-    console.log('  ✔ Successfully initiated sync and enqueued BullMQ job\n');
+    console.log('  ✔ Successfully initiated sync, enqueued BullMQ job, and returned tracking metadata\n');
   }
 
   // Test 15: Validate that requested GitHub account belongs to authenticated user (rejects foreign account)
@@ -734,6 +738,57 @@ async function runTests() {
     assert.strictEqual(caughtError.getStatus(), 403);
     assert.ok(caughtError.message.includes('access to this workspace'));
     console.log('  ✔ Unauthorized workspace access rejected with 403 Forbidden\n');
+  }
+
+  // Test 19: Get synchronization job status and tracking telemetry
+  {
+    console.log('Test 19: Get synchronization job status and tracking telemetry');
+    const mockPrisma = new MockPrismaClient();
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    const mockJob = {
+      id: 'job-123',
+      name: 'sync-user-repositories',
+      attemptsMade: 1,
+      progress: 50,
+      returnvalue: { syncedCount: 10 },
+      failedReason: null,
+      timestamp: Date.now() - 5000,
+      processedOn: Date.now() - 3000,
+      finishedOn: Date.now() - 1000,
+      getState: async () => 'completed',
+    };
+
+    (service as any).syncQueue = {
+      getJob: async (id: string) => {
+        if (id === 'job-123') return mockJob;
+        return null;
+      },
+    };
+
+    const controller = new (require('./repositories.controller').RepositoriesController)(service);
+    const user = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+
+    const statusRes = await controller.getSyncStatus(user as any, 'job-123');
+    assert.strictEqual(statusRes.jobId, 'job-123');
+    assert.strictEqual(statusRes.status, 'completed');
+    assert.strictEqual(statusRes.progress, 50);
+    assert.strictEqual(statusRes.result.syncedCount, 10);
+    assert.strictEqual(statusRes.attemptsMade, 1);
+    assert.ok(statusRes.createdAt);
+    assert.ok(statusRes.processedAt);
+    assert.ok(statusRes.finishedAt);
+
+    // Test non-existent job ID returns 404
+    let notFoundErr: any = null;
+    try {
+      await controller.getSyncStatus(user as any, 'job-unknown');
+    } catch (err) {
+      notFoundErr = err;
+    }
+    assert.ok(notFoundErr !== null);
+    assert.strictEqual(notFoundErr.getStatus(), 404);
+    console.log('  ✔ Sync job status tracking returns complete state and handles 404\n');
   }
 
   console.log('✅ ALL REPOSITORY SYNC, ISOLATION & TELEMETRY TESTS PASSED!\n');
