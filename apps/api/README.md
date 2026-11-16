@@ -9,6 +9,7 @@ The primary NestJS REST API application for the DevPulse platform.
 - **Request Tracing**: `x-request-id` and `x-correlation-id` correlation tracking with AsyncLocalStorage.
 - **Structured Logging**: Integrated `@devpulse/logger` with automatic PII and secret redaction.
 - **Database Safety**: Prisma errors securely mapped to HTTP status codes without leaking internal SQL or schemas.
+- **Repository Synchronization**: Asynchronous repository sync via BullMQ with duplicate protection and persistent status tracking (`docs/api/repository-synchronization.md`).
 
 ## Scripts
 
