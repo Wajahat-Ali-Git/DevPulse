@@ -241,6 +241,32 @@ export interface WebhookEventPayload {
 }
 
 /**
+ * Supported synchronization scopes for repository synchronization jobs.
+ */
+export type SyncScope = 'all' | 'repositories' | 'commits' | 'pull_requests' | 'metadata';
+
+/**
+ * Payload for synchronizing repositories belonging to a user/account.
+ * Contains user identifier, linked GitHub account, sync identifier, and requested scope.
+ */
+export interface RepositorySyncJobPayload {
+  /** Authenticated user identifier initiating or owning the synchronization */
+  userId: string;
+  /** Linked GitHub account identifier used for fetching GitHub resources */
+  githubAccountId: string;
+  /** Unique synchronization identifier for tracking, status retrieval, and correlation */
+  syncId: string;
+  /** Requested synchronization scope (e.g. 'all', 'repositories', 'commits', 'pull_requests', 'metadata') */
+  scope: SyncScope | string;
+  /** Associated workspace identifier */
+  workspaceId?: string;
+  /** Whether to force a full re-sync bypassing incremental caches */
+  forced?: boolean;
+  /** Correlation tracking identifier */
+  correlationId?: string;
+}
+
+/**
  * Payload for synchronizing all repositories belonging to a user/workspace.
  */
 export interface SyncUserRepositoriesPayload {
@@ -248,6 +274,9 @@ export interface SyncUserRepositoriesPayload {
   workspaceId: string;
   installationId?: number;
   forced?: boolean;
+  githubAccountId?: string;
+  syncId?: string;
+  scope?: SyncScope | string;
 }
 
 /**
