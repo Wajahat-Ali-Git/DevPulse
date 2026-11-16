@@ -155,6 +155,7 @@ async function runTests() {
   // Test 5: RepositorySyncWorker processing logic
   console.log('Test 5: RepositorySyncWorker executes sync job and returns success');
   const repoSyncWorker = new RepositorySyncWorker(redisService);
+  const updatedProgress: number[] = [];
   const syncMockJob = {
     id: 'job_sync_1',
     name: JobName.SYNC_USER_REPOSITORIES,
@@ -162,13 +163,45 @@ async function runTests() {
       userId: 'usr_1',
       workspaceId: 'ws_1',
       forced: true,
+      syncId: 'sync-123',
+    },
+    updateProgress: async (p: number) => {
+      updatedProgress.push(p);
     },
   } as any;
+
+  // Mock processor on repoSyncWorker to test progress hook and return payload
+  (repoSyncWorker as any).gitHubSyncProcessor = {
+    syncUserRepositories: async (
+      _payload: any,
+      _opts: any,
+      _client: any,
+      onProgress: any,
+    ) => {
+      if (onProgress) {
+        await onProgress({ page: 1, perPage: 100, totalProcessed: 100, hasMore: true, percentage: 50 });
+        await onProgress({ page: 2, perPage: 100, totalProcessed: 150, hasMore: false, percentage: 100 });
+      }
+      return {
+        repositories: [],
+        totalCount: 150,
+        userId: 'usr_1',
+        syncId: 'sync-123',
+        scope: 'all',
+        pagesProcessed: 2,
+      };
+    },
+  };
 
   const syncResult = await repoSyncWorker.processJob(syncMockJob);
   assert.strictEqual(syncResult.success, true);
   assert.strictEqual(syncResult.jobName, JobName.SYNC_USER_REPOSITORIES);
-  console.log('  ✔ RepositorySyncWorker handles repository sync payload\n');
+  assert.ok(syncResult.data, 'syncResult should include data from processor');
+  assert.strictEqual(syncResult.data.userId, 'usr_1');
+  assert.strictEqual(syncResult.data.totalCount, 150);
+  assert.strictEqual(syncResult.details?.totalCount, 150);
+  assert.deepStrictEqual(updatedProgress, [50, 100], 'Job updateProgress should be called with progress updates');
+  console.log('  ✔ RepositorySyncWorker handles repository sync payload and updates progress\n');
 
   // Test 6: MetricsWorker processing logic
   console.log('Test 6: MetricsWorker processes metrics calculation payload');
@@ -294,13 +327,26 @@ async function runTests() {
   assert.strictEqual(isRetryableError(new GitHubForbiddenError('insufficient scope')), false);
   assert.strictEqual(isRetryableError(new TypeError('Cannot read property of undefined')), false);
 
-  // Retryable failures
+  // Retryable failures (transient failures and rate limits)
   assert.strictEqual(isRetryableError(new RetryableJobError('network glitch')), true);
   assert.strictEqual(isRetryableError(new GitHubTransientError('503 Service Unavailable')), true);
   assert.strictEqual(isRetryableError(new GitHubRateLimitError('rate limit exceeded', { limit: 5000, remaining: 0, reset: 1234567, used: 5000 })), true);
   assert.strictEqual(isRetryableError(new Error('connect ECONNREFUSED 127.0.0.1:6379')), true);
   assert.strictEqual(isRetryableError(new Error('ETIMEDOUT request timed out')), true);
   assert.strictEqual(isRetryableError(new Error('Deadlock detected when acquiring lock')), true);
+
+  // Specialized RateLimitJobError and TransientJobError
+  const { RateLimitJobError, TransientJobError } = require('./job-errors');
+  const rateLimitErr = new RateLimitJobError('GitHub primary rate limit reached', 1700000000, 60000);
+  assert.strictEqual(isRetryableError(rateLimitErr), true);
+  assert.strictEqual(rateLimitErr.isRateLimit, true);
+  assert.strictEqual(rateLimitErr.retryAfterMs, 60000);
+
+  const transientErr = new TransientJobError('Temporary upstream gateway reset', 502);
+  assert.strictEqual(isRetryableError(transientErr), true);
+  assert.strictEqual(transientErr.isTransient, true);
+  assert.strictEqual(transientErr.statusCode, 502);
+
   console.log('  ✔ Error classification verified across domain, GitHub, and network error classes\n');
 
   // Test 12: Permanent error normalization into UnrecoverableError

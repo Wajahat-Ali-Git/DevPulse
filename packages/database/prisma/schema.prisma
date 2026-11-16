@@ -53,6 +53,24 @@ enum ActivityEventType {
   OTHER
 }
 
+enum SyncRunStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  COMPLETED
+  PARTIALLY_COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum SyncRunType {
+  USER_REPOSITORIES
+  SINGLE_REPOSITORY
+  REPOSITORY_COMMITS
+  REPOSITORY_PULL_REQUESTS
+  FULL
+}
+
 // ------------------------------------------------------
 // Models
 // ------------------------------------------------------
@@ -74,6 +92,7 @@ model User {
   pullRequests    PullRequest[]     @relation("PullRequestAuthorUser")
   reviews         Review[]          @relation("ReviewAuthorUser")
   activityEvents  ActivityEvent[]
+  syncRuns        SyncRun[]
 
   @@map("users")
 }
@@ -124,6 +143,7 @@ model Workspace {
 
   members      WorkspaceMember[]
   repositories Repository[]
+  syncRuns     SyncRun[]
 
   @@map("workspaces")
 }
@@ -309,4 +329,35 @@ model ActivityEvent {
   @@index([actorUsername])
   @@index([occurredAt])
   @@map("activity_events")
+}
+
+model SyncRun {
+  id              String        @id @default(uuid())
+  userId          String        @map("user_id")
+  githubAccountId String?       @map("github_account_id")
+  jobId           String?       @map("job_id")
+  type            SyncRunType   @default(USER_REPOSITORIES)
+  status          SyncRunStatus @default(PENDING)
+  startedAt       DateTime?     @map("started_at")
+  completedAt     DateTime?     @map("completed_at")
+  lastProcessedAt DateTime?     @map("last_processed_at")
+  totalItems      Int           @default(0) @map("total_items")
+  processedItems  Int           @default(0) @map("processed_items")
+  errorMessage    String?       @map("error_message")
+  scope           String?
+  workspaceId     String?       @map("workspace_id")
+  correlationId   String?       @map("correlation_id")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([status])
+  @@index([jobId])
+  @@index([githubAccountId])
+  @@index([workspaceId])
+  @@index([createdAt])
+  @@map("sync_runs")
 }

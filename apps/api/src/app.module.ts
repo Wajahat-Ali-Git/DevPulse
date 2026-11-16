@@ -7,9 +7,10 @@ import { RedisService } from './redis.service';
 
 import { HealthModule } from './health';
 import { AuthModule, AuthMiddleware, JwtAuthGuard, RolesGuard } from './auth';
+import { RepositoriesModule } from './repositories';
 
 @Module({
-  imports: [HealthModule, AuthModule],
+  imports: [HealthModule, AuthModule, RepositoriesModule],
   controllers: [AppController],
   providers: [
     AppService,

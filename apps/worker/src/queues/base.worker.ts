@@ -1,6 +1,6 @@
 import { OnModuleDestroy } from '@nestjs/common';
 import { Worker, Job, WorkerOptions, ConnectionOptions, UnrecoverableError } from 'bullmq';
-import { Logger, CorrelationContext } from '@devpulse/logger';
+import { Logger, CorrelationContext, redactCredentialString, redactSensitiveData } from '@devpulse/logger';
 import { QueueName } from '@devpulse/types';
 import { RedisService } from '../redis/redis.service';
 import { resolveQueueConcurrency, DefaultQueueConfigs } from './queue.config';
@@ -21,6 +21,8 @@ export interface FailedJobDetails {
   attemptsMade: number;
   maxAttempts: number;
   isPermanent: boolean;
+  isRateLimit?: boolean;
+  isTransient?: boolean;
   errorMessage: string;
   failedReason?: string;
   stack?: string;
@@ -119,9 +121,16 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
               const normalized = normalizeJobError(rawError);
               const isRetryable = isRetryableError(rawError);
               const isPermanent = !isRetryable;
+              const isRateLimit = (rawError as any)?.isRateLimit === true || (rawError as any)?.isRateLimitExceeded === true;
+              const isTransient = (rawError as any)?.isTransient === true;
+
+              // Redact sensitive credentials/tokens from error message and stack trace
+              const safeErrorMessage = redactCredentialString(normalized.message);
+              const safeStack = normalized.stack ? redactCredentialString(normalized.stack) : undefined;
+              const safePayload = job.data ? redactSensitiveData(job.data) : undefined;
 
               this.logger.warn(
-                `Job execution [${job.id}] "${job.name}" failed after ${durationMs}ms with ${isPermanent ? 'PERMANENT' : 'RETRYABLE'} failure: ${normalized.message}`,
+                `Job execution [${job.id}] "${job.name}" failed after ${durationMs}ms with ${isPermanent ? 'PERMANENT' : isRateLimit ? 'RATE_LIMIT' : 'TRANSIENT/RETRYABLE'} failure: ${safeErrorMessage}`,
                 {
                   jobId: job.id,
                   jobName: job.name,
@@ -131,12 +140,14 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
                   attemptsMade: job.attemptsMade,
                   maxAttempts: job.opts?.attempts ?? 1,
                   isPermanent,
-                  error: normalized.message,
-                  stack: normalized.stack,
+                  isRateLimit,
+                  isTransient,
+                  error: safeErrorMessage,
+                  stack: safeStack,
                 },
               );
 
-              // Hook for failed job processing
+              // Hook for failed job processing with sanitized credentials
               await this.handleFailedJob({
                 jobId: String(job.id),
                 jobName: job.name,
@@ -144,12 +155,14 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
                 attemptsMade: job.attemptsMade + 1,
                 maxAttempts: job.opts?.attempts ?? 1,
                 isPermanent,
-                errorMessage: normalized.message,
-                failedReason: normalized.message,
-                stack: normalized.stack,
+                isRateLimit,
+                isTransient,
+                errorMessage: safeErrorMessage,
+                failedReason: safeErrorMessage,
+                stack: safeStack,
                 correlationId: String(correlationId),
                 failedAt: new Date().toISOString(),
-                payload: job.data,
+                payload: safePayload,
               });
 
               throw normalized;
@@ -215,15 +228,17 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
       const jobId = job?.id ?? 'unknown';
       const jobName = job?.name ?? 'unknown';
       const isUnrecoverable = error instanceof UnrecoverableError;
+      const safeErrorMsg = redactCredentialString(error.message);
+      const safeErrorStack = error.stack ? redactCredentialString(error.stack) : undefined;
 
       this.logger.error(
-        `Job [${jobId}] "${jobName}" moved to failed state on [${this.queueName}] ${isUnrecoverable ? '(PERMANENT - NO RETRY)' : '(RETRYING)'}: ${error.message}`,
+        `Job [${jobId}] "${jobName}" moved to failed state on [${this.queueName}] ${isUnrecoverable ? '(PERMANENT - NO RETRY)' : '(RETRYING)'}: ${safeErrorMsg}`,
         {
           jobId,
           jobName,
           queue: this.queueName,
-          error: error.message,
-          stack: error.stack,
+          error: safeErrorMsg,
+          stack: safeErrorStack,
           isPermanent: isUnrecoverable,
         },
       );

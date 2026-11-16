@@ -241,6 +241,77 @@ export interface WebhookEventPayload {
 }
 
 /**
+ * Supported synchronization scopes for repository synchronization jobs.
+ */
+export type SyncScope = 'all' | 'repositories' | 'commits' | 'pull_requests' | 'metadata';
+
+/**
+ * Status of a synchronization run or background job.
+ */
+export type SyncRunStatus =
+  | 'PENDING'
+  | 'QUEUED'
+  | 'PROCESSING'
+  | 'COMPLETED'
+  | 'PARTIALLY_COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+/**
+ * Type or scope category of a synchronization run.
+ */
+export type SyncRunType =
+  | 'USER_REPOSITORIES'
+  | 'SINGLE_REPOSITORY'
+  | 'REPOSITORY_COMMITS'
+  | 'REPOSITORY_PULL_REQUESTS'
+  | 'FULL';
+
+/**
+ * Tracking record for a synchronization run.
+ */
+export interface SyncRun {
+  id: string;
+  userId: string;
+  githubAccountId?: string | null;
+  jobId?: string | null;
+  type: SyncRunType;
+  status: SyncRunStatus;
+  startedAt?: Date | null;
+  completedAt?: Date | null;
+  lastProcessedAt?: Date | null;
+  totalItems: number;
+  processedItems: number;
+  errorMessage?: string | null;
+  scope?: string | null;
+  workspaceId?: string | null;
+  correlationId?: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Payload for synchronizing repositories belonging to a user/account.
+ * Contains user identifier, linked GitHub account, sync identifier, and requested scope.
+ */
+export interface RepositorySyncJobPayload {
+  /** Authenticated user identifier initiating or owning the synchronization */
+  userId: string;
+  /** Linked GitHub account identifier used for fetching GitHub resources */
+  githubAccountId: string;
+  /** Unique synchronization identifier for tracking, status retrieval, and correlation */
+  syncId: string;
+  /** Requested synchronization scope (e.g. 'all', 'repositories', 'commits', 'pull_requests', 'metadata') */
+  scope: SyncScope | string;
+  /** Associated workspace identifier */
+  workspaceId?: string;
+  /** Whether to force a full re-sync bypassing incremental caches */
+  forced?: boolean;
+  /** Correlation tracking identifier */
+  correlationId?: string;
+}
+
+/**
  * Payload for synchronizing all repositories belonging to a user/workspace.
  */
 export interface SyncUserRepositoriesPayload {
@@ -248,6 +319,9 @@ export interface SyncUserRepositoriesPayload {
   workspaceId: string;
   installationId?: number;
   forced?: boolean;
+  githubAccountId?: string;
+  syncId?: string;
+  scope?: SyncScope | string;
 }
 
 /**

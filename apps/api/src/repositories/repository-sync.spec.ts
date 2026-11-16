@@ -44,6 +44,19 @@ function makeMockGitHubRepo(overrides: Partial<GitHubRepository> = {}): GitHubRe
 class MockPrismaClient {
   public repositories: any[] = [];
   public workspaceMembers: any[] = [];
+  public gitHubAccounts: any[] = [];
+
+  gitHubAccount = {
+    findFirst: async ({ where }: { where: { id?: string; userId?: string } }) => {
+      return (
+        this.gitHubAccounts.find((a) => {
+          if (where.id && a.id !== where.id) return false;
+          if (where.userId && a.userId !== where.userId) return false;
+          return true;
+        }) || null
+      );
+    },
+  };
 
   workspaceMember = {
     findUnique: async ({ where }: { where: { workspaceId_userId: { workspaceId: string; userId: string } } }) => {
@@ -557,6 +570,391 @@ async function runTests() {
     assert.strictEqual(secondSync.status, RepositoryStatus.ACTIVE);
     assert.strictEqual(secondSync.isArchived, false);
     console.log('  ✔ Repository unarchival recognized and status restored to ACTIVE\n');
+  }
+
+  // Test 14: Authenticated endpoint initiates repository synchronization and enqueues BullMQ job
+  {
+    console.log('Test 14: Authenticated endpoint initiates repository synchronization and enqueues BullMQ job');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({ workspaceId: 'ws-test', userId: 'user-alice' });
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-acc-1',
+      userId: 'user-alice',
+      username: 'alice-gh',
+    });
+
+    let enqueuedJobName = '';
+    let enqueuedPayload: any = null;
+    const mockQueue: any = {
+      add: async (name: string, payload: any) => {
+        enqueuedJobName = name;
+        enqueuedPayload = payload;
+        return { id: 'bullmq-job-101' };
+      },
+    };
+
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+    (service as any).syncQueue = mockQueue;
+
+    const controller = new (require('./repositories.controller').RepositoriesController)(service);
+
+    const user = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+    const response = await controller.initiateSync(user as any, {
+      workspaceId: 'ws-test',
+      githubAccountId: 'gh-acc-1',
+      forced: true,
+    });
+
+    assert.strictEqual(response.status, 'enqueued');
+    assert.strictEqual(response.jobId, 'bullmq-job-101');
+    assert.strictEqual(response.queueName, 'repository-sync');
+    assert.strictEqual(response.jobName, 'sync-user-repositories');
+    assert.strictEqual(response.githubAccountId, 'gh-acc-1');
+    assert.strictEqual(response.workspaceId, 'ws-test');
+    assert.strictEqual(response.userId, 'user-alice');
+    assert.ok(response.tracking);
+    assert.strictEqual(response.tracking.checkStatusUrl, '/api/v1/sync/bullmq-job-101');
+    assert.ok(response.tracking.correlationId);
+    assert.strictEqual(response.tracking.pollingIntervalMs, 2000);
+    assert.strictEqual(enqueuedJobName, 'sync-user-repositories');
+    assert.strictEqual(enqueuedPayload.userId, 'user-alice');
+    assert.strictEqual(enqueuedPayload.workspaceId, 'ws-test');
+    assert.strictEqual(enqueuedPayload.forced, true);
+    assert.strictEqual(enqueuedPayload.githubAccountId, 'gh-acc-1');
+    assert.ok(enqueuedPayload.syncId);
+    assert.strictEqual(enqueuedPayload.scope, 'all');
+    console.log('  ✔ Successfully initiated sync, enqueued BullMQ job, and returned tracking metadata\n');
+  }
+
+  // Test 15: Validate that requested GitHub account belongs to authenticated user (rejects foreign account)
+  {
+    console.log('Test 15: Validate requested GitHub account belongs to authenticated user (rejects foreign account)');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({ workspaceId: 'ws-test', userId: 'user-alice' });
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-acc-bob',
+      userId: 'user-bob', // Belongs to Bob, NOT Alice
+      username: 'bob-gh',
+    });
+
+    const mockQueue: any = { add: async () => ({ id: '1' }) };
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+    (service as any).syncQueue = mockQueue;
+
+    const controller = new (require('./repositories.controller').RepositoriesController)(service);
+    const aliceUser = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+
+    let caughtError: any = null;
+    try {
+      await controller.initiateSync(aliceUser as any, {
+        workspaceId: 'ws-test',
+        githubAccountId: 'gh-acc-bob',
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    assert.ok(caughtError !== null, 'Should have thrown AuthorizationException');
+    assert.strictEqual(caughtError.getStatus(), 403);
+    assert.ok(caughtError.message.includes('does not belong to the authenticated user'));
+    console.log('  ✔ Foreign GitHub account access rejected with 403 Forbidden\n');
+  }
+
+  // Test 16: Reject sync when requested GitHub account does not exist (404 Not Found)
+  {
+    console.log('Test 16: Reject sync when requested GitHub account does not exist (404 Not Found)');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({ workspaceId: 'ws-test', userId: 'user-alice' });
+
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+    const controller = new (require('./repositories.controller').RepositoriesController)(service);
+    const aliceUser = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+
+    let caughtError: any = null;
+    try {
+      await controller.initiateSync(aliceUser as any, {
+        workspaceId: 'ws-test',
+        githubAccountId: 'gh-acc-non-existent',
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    assert.ok(caughtError !== null, 'Should have thrown ResourceNotFoundException');
+    assert.strictEqual(caughtError.getStatus(), 404);
+    assert.ok(caughtError.message.includes('not found'));
+    console.log('  ✔ Non-existent GitHub account rejected with 404 Not Found\n');
+  }
+
+  // Test 17: Default to user primary GitHub account when githubAccountId is omitted
+  {
+    console.log('Test 17: Default to user primary GitHub account when githubAccountId is omitted');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({ workspaceId: 'ws-test', userId: 'user-alice' });
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-acc-primary',
+      userId: 'user-alice',
+      username: 'alice-primary',
+    });
+
+    const mockQueue: any = { add: async () => ({ id: 'bullmq-job-default' }) };
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+    (service as any).syncQueue = mockQueue;
+
+    const controller = new (require('./repositories.controller').RepositoriesController)(service);
+    const aliceUser = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+
+    const response = await controller.initiateSync(aliceUser as any, {
+      workspaceId: 'ws-test',
+    });
+
+    assert.strictEqual(response.status, 'enqueued');
+    assert.strictEqual(response.githubAccountId, 'gh-acc-primary');
+    console.log('  ✔ Successfully defaulted to authenticated user primary linked account\n');
+  }
+
+  // Test 18: Reject sync when user has no access to workspace
+  {
+    console.log('Test 18: Reject sync when user has no access to workspace (403 Forbidden)');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-acc-alice',
+      userId: 'user-alice',
+      username: 'alice-gh',
+    });
+    // Alice is NOT in workspace 'ws-unauthorized'
+
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+    const controller = new (require('./repositories.controller').RepositoriesController)(service);
+    const aliceUser = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+
+    let caughtError: any = null;
+    try {
+      await controller.initiateSync(aliceUser as any, {
+        workspaceId: 'ws-unauthorized',
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    assert.ok(caughtError !== null, 'Should have thrown AuthorizationException');
+    assert.strictEqual(caughtError.getStatus(), 403);
+    assert.ok(caughtError.message.includes('access to this workspace'));
+    console.log('  ✔ Unauthorized workspace access rejected with 403 Forbidden\n');
+  }
+
+  // Test 19: Get synchronization job status and tracking telemetry
+  {
+    console.log('Test 19: Get synchronization job status and tracking telemetry');
+    const mockPrisma = new MockPrismaClient();
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    const mockJob = {
+      id: 'job-123',
+      name: 'sync-user-repositories',
+      attemptsMade: 1,
+      progress: 50,
+      returnvalue: { syncedCount: 10 },
+      failedReason: null,
+      timestamp: Date.now() - 5000,
+      processedOn: Date.now() - 3000,
+      finishedOn: Date.now() - 1000,
+      getState: async () => 'completed',
+    };
+
+    (service as any).syncQueue = {
+      getJob: async (id: string) => {
+        if (id === 'job-123') return mockJob;
+        return null;
+      },
+    };
+
+    const controller = new (require('./repositories.controller').RepositoriesController)(service);
+    const user = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+
+    const statusRes = await controller.getSyncStatus(user as any, 'job-123');
+    assert.strictEqual(statusRes.syncId, 'job-123');
+    assert.strictEqual(statusRes.jobId, 'job-123');
+    assert.strictEqual(statusRes.status, 'completed');
+    assert.strictEqual(statusRes.progress, 50);
+    assert.strictEqual(statusRes.result.syncedCount, 10);
+    assert.strictEqual(statusRes.attemptsMade, 1);
+    assert.ok(statusRes.createdAt);
+    assert.ok(statusRes.processedAt);
+    assert.ok(statusRes.finishedAt);
+
+    // Test non-existent job ID returns 404
+    let notFoundErr: any = null;
+    try {
+      await controller.getSyncStatus(user as any, 'job-unknown');
+    } catch (err) {
+      notFoundErr = err;
+    }
+    assert.ok(notFoundErr !== null);
+    assert.strictEqual(notFoundErr.getStatus(), 404);
+    console.log('  ✔ Sync job status tracking returns complete state and handles 404\n');
+  }
+
+  // Test 20: SyncController endpoints: POST /api/v1/sync/repositories, GET /api/v1/sync/:syncId, GET /api/v1/sync/history
+  {
+    console.log('Test 20: SyncController endpoints (POST /sync/repositories, GET /sync/:syncId, GET /sync/history)');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push(
+      { workspaceId: 'ws-1', userId: 'user-alice', role: 'MEMBER' },
+      { workspaceId: 'ws-2', userId: 'user-alice', role: 'MEMBER' },
+      { workspaceId: 'ws-3', userId: 'user-bob', role: 'MEMBER' },
+    );
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-alice',
+      userId: 'user-alice',
+      username: 'alice',
+      accessToken: 'token-alice',
+    });
+
+    const service = new RepositorySyncService({ client: mockPrisma as any } as any);
+
+    let enqueuedPayload: any = null;
+    const mockJobsMap = new Map<string, any>();
+
+    (service as any).syncQueue = {
+      add: async (name: string, payload: any, opts: any) => {
+        enqueuedPayload = payload;
+        const jobId = opts.jobId || 'job-sync-test';
+        const jobRecord = {
+          id: jobId,
+          name,
+          data: payload,
+          attemptsMade: 1,
+          progress: 100,
+          returnvalue: { syncedCount: 5 },
+          failedReason: null,
+          timestamp: Date.now() - 2000,
+          processedOn: Date.now() - 1000,
+          finishedOn: Date.now(),
+          getState: async () => 'completed',
+        };
+        mockJobsMap.set(jobId, jobRecord);
+        return jobRecord;
+      },
+      getJob: async (id: string) => mockJobsMap.get(id) || null,
+    };
+
+    const { SyncController } = require('./sync.controller');
+    const syncController = new SyncController(service);
+    const alice = { sub: 'user-alice', email: 'alice@example.com', role: 'MEMBER' };
+    const bob = { sub: 'user-bob', email: 'bob@example.com', role: 'MEMBER' };
+
+    // 1. POST /api/v1/sync/repositories
+    const initRes = await syncController.initiateRepositoriesSync(alice as any, {
+      workspaceId: 'ws-1',
+      githubAccountId: 'gh-alice',
+    });
+    assert.strictEqual(initRes.status, 'enqueued');
+    assert.strictEqual(initRes.workspaceId, 'ws-1');
+    assert.strictEqual(initRes.userId, 'user-alice');
+    assert.ok(initRes.syncId);
+    assert.strictEqual(initRes.syncId, initRes.jobId);
+    assert.strictEqual(initRes.tracking.checkStatusUrl, `/api/v1/sync/${initRes.jobId}`);
+
+    // 2. GET /api/v1/sync/:syncId
+    const statusRes = await syncController.getSyncStatus(alice as any, initRes.syncId);
+    assert.strictEqual(statusRes.syncId, initRes.syncId);
+    assert.strictEqual(statusRes.jobId, initRes.jobId);
+    assert.strictEqual(statusRes.status, 'completed');
+    assert.strictEqual(statusRes.progress, 100);
+    assert.strictEqual(statusRes.result.syncedCount, 5);
+
+    // 3. GET /api/v1/sync/history (Alice sees her workspaces ws-1 and ws-2, but not Bob's ws-3)
+    const historyAlice = await syncController.getSyncHistory(alice as any);
+    assert.ok(Array.isArray(historyAlice));
+    assert.ok(historyAlice.length >= 1);
+    assert.strictEqual(historyAlice[0].syncId, initRes.syncId);
+    assert.strictEqual(historyAlice[0].workspaceId, 'ws-1');
+    assert.strictEqual(historyAlice[0].status, 'completed');
+
+    // Bob cannot see Alice's workspace ws-1 sync history
+    const historyBob = await syncController.getSyncHistory(bob as any);
+    assert.strictEqual(historyBob.length, 0);
+
+    // Specific workspace history filter
+    const historyWs1 = await syncController.getSyncHistory(alice as any, 'ws-1');
+    assert.strictEqual(historyWs1.length, 1);
+    assert.strictEqual(historyWs1[0].workspaceId, 'ws-1');
+
+    // Alice attempting to query sync history of ws-3 (Bob's workspace) throws 403
+    let forbiddenErr: any = null;
+    try {
+      await syncController.getSyncHistory(alice as any, 'ws-3');
+    } catch (err) {
+      forbiddenErr = err;
+    }
+    assert.ok(forbiddenErr !== null);
+    assert.strictEqual(forbiddenErr.getStatus(), 403);
+
+    console.log('  ✔ POST /sync/repositories, GET /sync/:syncId, and GET /sync/history work with multi-tenant isolation\n');
+  }
+
+  // Test 21: Prevent duplicate active synchronization jobs for the same account and scope (409 Conflict)
+  {
+    console.log('Test 21: Prevent duplicate active synchronization jobs for the same account and scope');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({ workspaceId: 'ws-1', userId: 'user-alice' });
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-alice',
+      userId: 'user-alice',
+      username: 'alice',
+      githubUserId: BigInt(12345),
+    });
+
+    const mockQueue: any = {
+      add: async () => ({ id: 'job-1' }),
+      getJob: async () => null,
+    };
+    const mockQueueService: any = {
+      getQueue: () => mockQueue as any,
+      addSyncUserRepositoriesJob: async (payload: any) => ({ id: 'job-1', data: payload }),
+    };
+    const service = new RepositorySyncService(
+      { client: mockPrisma as any } as any,
+      undefined,
+      mockQueueService,
+    );
+
+    // First sync enqueues cleanly
+    const firstSync = await service.enqueueRepositorySync('user-alice', {
+      workspaceId: 'ws-1',
+      githubAccountId: 'gh-alice',
+      scope: 'repositories',
+    });
+    assert.ok(firstSync.syncId);
+    assert.strictEqual(firstSync.status, 'enqueued');
+
+    // Second sync on same account and scope while first is active throws 409 Conflict
+    let duplicateError: any = null;
+    try {
+      await service.enqueueRepositorySync('user-alice', {
+        workspaceId: 'ws-1',
+        githubAccountId: 'gh-alice',
+        scope: 'repositories',
+      });
+    } catch (err) {
+      duplicateError = err;
+    }
+    assert.ok(duplicateError !== null, 'Should have thrown duplicate sync error');
+    assert.strictEqual(duplicateError.getStatus(), 409);
+    assert.strictEqual(duplicateError.code, 'CONFLICT');
+
+    // Forced sync bypasses duplicate check
+    const forcedSync = await service.enqueueRepositorySync('user-alice', {
+      workspaceId: 'ws-1',
+      githubAccountId: 'gh-alice',
+      scope: 'repositories',
+      forced: true,
+    });
+    assert.ok(forcedSync.syncId);
+    assert.strictEqual(forcedSync.status, 'enqueued');
+
+    console.log('  ✔ Duplicate active sync prevention and forced bypass verified\n');
   }
 
   console.log('✅ ALL REPOSITORY SYNC, ISOLATION & TELEMETRY TESTS PASSED!\n');
