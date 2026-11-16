@@ -165,9 +165,21 @@ async function runTests() {
     },
   } as any;
 
+  // Mock processor on repoSyncWorker to avoid network calls during worker test
+  (repoSyncWorker as any).gitHubSyncProcessor = {
+    syncUserRepositories: async () => ({
+      repositories: [],
+      totalCount: 0,
+      userId: 'usr_1',
+      scope: 'all',
+    }),
+  };
+
   const syncResult = await repoSyncWorker.processJob(syncMockJob);
   assert.strictEqual(syncResult.success, true);
   assert.strictEqual(syncResult.jobName, JobName.SYNC_USER_REPOSITORIES);
+  assert.ok(syncResult.data, 'syncResult should include data from processor');
+  assert.strictEqual(syncResult.data.userId, 'usr_1');
   console.log('  ✔ RepositorySyncWorker handles repository sync payload\n');
 
   // Test 6: MetricsWorker processing logic
