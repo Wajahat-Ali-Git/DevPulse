@@ -108,9 +108,14 @@ export class RepositorySyncService implements OnModuleDestroy {
 
     // 3. Construct job payload and correlation tracking
     const correlationId = `sync_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const syncId = correlationId;
+    const scope = dto.scope || 'all';
     const payload: SyncUserRepositoriesPayload & { correlationId: string } = {
       userId,
       workspaceId: dto.workspaceId,
+      githubAccountId: gitHubAccount.id,
+      syncId,
+      scope,
       forced: dto.forced ?? false,
       correlationId,
     };
@@ -119,13 +124,13 @@ export class RepositorySyncService implements OnModuleDestroy {
     let job: any;
     if (this.syncQueueService) {
       job = await this.syncQueueService.addSyncUserRepositoriesJob(payload, {
-        jobId: correlationId,
+        jobId: syncId,
         correlationId,
       });
     } else {
       const queue = this.getSyncQueue();
       job = await queue.add(JobName.SYNC_USER_REPOSITORIES, payload, {
-        jobId: correlationId,
+        jobId: syncId,
       });
     }
 
@@ -166,6 +171,7 @@ export class RepositorySyncService implements OnModuleDestroy {
       githubAccountId: gitHubAccount.id,
       workspaceId: dto.workspaceId,
       userId,
+      scope,
       tracking: {
         checkStatusUrl: `/api/v1/sync/${jobIdStr}`,
         correlationId,

@@ -1,4 +1,5 @@
 import { IsString, IsNotEmpty, IsOptional, IsBoolean } from 'class-validator';
+import { SyncScope } from '@devpulse/types';
 
 export class InitiateSyncDto {
   @IsString()
@@ -12,5 +13,9 @@ export class InitiateSyncDto {
   @IsBoolean()
   @IsOptional()
   forced?: boolean;
+
+  @IsString()
+  @IsOptional()
+  scope?: SyncScope | string;
 }
 

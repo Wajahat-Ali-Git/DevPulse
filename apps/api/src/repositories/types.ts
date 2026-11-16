@@ -53,6 +53,7 @@ export interface InitiateSyncRequestDto {
   githubAccountId?: string;
   workspaceId: string;
   forced?: boolean;
+  scope?: string;
 }
 
 export interface InitiateSyncResponseDto {
@@ -65,6 +66,7 @@ export interface InitiateSyncResponseDto {
   githubAccountId: string;
   workspaceId: string;
   userId: string;
+  scope?: string;
   tracking: {
     checkStatusUrl: string;
     correlationId: string;
