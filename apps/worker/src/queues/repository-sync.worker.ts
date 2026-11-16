@@ -10,6 +10,7 @@ import {
   RepositorySyncJobPayload as DedicatedSyncPayload,
 } from '@devpulse/types';
 import { CorrelationContext } from '@devpulse/logger';
+import { prisma } from '@devpulse/database';
 import { RedisService } from '../redis/redis.service';
 import { BaseWorker } from './base.worker';
 import { GitHubSyncProcessor } from '../processors/github-sync.processor';
@@ -53,6 +54,8 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
   async processJob(job: Job<RepositorySyncJobPayload, RepositorySyncJobResult>): Promise<RepositorySyncJobResult> {
     const jobName = job.name;
     const processor = this.gitHubSyncProcessor || new GitHubSyncProcessor();
+    const syncId = (job.data as any)?.syncId || String(job.id);
+    const userId = (job.data as any)?.userId;
 
     return CorrelationContext.run({ service: 'worker', jobId: job.id }, async () => {
       this.logger.info(`Starting repository sync job "${jobName}" [${job.id}]`, {
@@ -61,71 +64,146 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
         payload: job.data,
       });
 
-      let syncData: any = undefined;
-
-      switch (jobName) {
-        case JobName.SYNC_USER_REPOSITORIES: {
-          syncData = await processor.syncUserRepositories(
-            job.data as SyncUserRepositoriesPayload,
-            {},
-            undefined,
-            async (progressUpdate) => {
-              if (typeof job.updateProgress === 'function') {
-                await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
-              }
+      // Update SyncRun state to PROCESSING if record exists
+      try {
+        if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+          await prisma.syncRun.updateMany({
+            where: {
+              OR: [{ id: syncId }, { jobId: String(job.id) }],
             },
-          );
-          break;
-        }
-        case JobName.SYNC_SINGLE_REPOSITORY: {
-          syncData = await processor.syncSingleRepository(job.data as SyncSingleRepositoryPayload);
-          if (typeof job.updateProgress === 'function') {
-            await job.updateProgress(100);
-          }
-          break;
-        }
-        case JobName.SYNC_REPOSITORY_COMMITS: {
-          syncData = await processor.syncRepositoryCommits(job.data as SyncRepositoryCommitsPayload);
-          if (typeof job.updateProgress === 'function') {
-            await job.updateProgress(100);
-          }
-          break;
-        }
-        case JobName.SYNC_REPOSITORY_PULL_REQUESTS: {
-          syncData = await processor.syncRepositoryPullRequests(job.data as SyncRepositoryPullRequestsPayload);
-          if (typeof job.updateProgress === 'function') {
-            await job.updateProgress(100);
-          }
-          break;
-        }
-        default: {
-          this.logger.warn(`Unknown sync job name: "${jobName}", using default user repositories sync handler`);
-          syncData = await processor.syncUserRepositories(
-            job.data as SyncUserRepositoriesPayload,
-            {},
-            undefined,
-            async (progressUpdate) => {
-              if (typeof job.updateProgress === 'function') {
-                await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
-              }
+            data: {
+              status: 'PROCESSING',
+              startedAt: new Date(),
+              lastProcessedAt: new Date(),
             },
-          );
+          });
         }
+      } catch (err: any) {
+        this.logger.debug(`Could not update SyncRun to PROCESSING: ${err?.message}`);
       }
 
-      return {
-        success: true,
-        jobName,
-        processedAt: new Date().toISOString(),
-        details: {
-          jobId: job.id,
-          syncId: (job.data as any)?.syncId,
-          userId: (job.data as any)?.userId,
-          scope: (job.data as any)?.scope,
-          totalCount: syncData?.totalCount,
-        },
-        data: syncData,
-      };
+      let syncData: any = undefined;
+
+      try {
+        switch (jobName) {
+          case JobName.SYNC_USER_REPOSITORIES: {
+            syncData = await processor.syncUserRepositories(
+              job.data as SyncUserRepositoriesPayload,
+              {},
+              undefined,
+              async (progressUpdate) => {
+                if (typeof job.updateProgress === 'function') {
+                  await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+                }
+                // Update SyncRun with intermediate progress
+                try {
+                  if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+                    await prisma.syncRun.updateMany({
+                      where: {
+                        OR: [{ id: syncId }, { jobId: String(job.id) }],
+                      },
+                      data: {
+                        processedItems: progressUpdate.totalProcessed ?? 0,
+                        lastProcessedAt: new Date(),
+                      },
+                    });
+                  }
+                } catch {
+                  // progress tracking failure shouldn't abort job
+                }
+              },
+            );
+            break;
+          }
+          case JobName.SYNC_SINGLE_REPOSITORY: {
+            syncData = await processor.syncSingleRepository(job.data as SyncSingleRepositoryPayload);
+            if (typeof job.updateProgress === 'function') {
+              await job.updateProgress(100);
+            }
+            break;
+          }
+          case JobName.SYNC_REPOSITORY_COMMITS: {
+            syncData = await processor.syncRepositoryCommits(job.data as SyncRepositoryCommitsPayload);
+            if (typeof job.updateProgress === 'function') {
+              await job.updateProgress(100);
+            }
+            break;
+          }
+          case JobName.SYNC_REPOSITORY_PULL_REQUESTS: {
+            syncData = await processor.syncRepositoryPullRequests(job.data as SyncRepositoryPullRequestsPayload);
+            if (typeof job.updateProgress === 'function') {
+              await job.updateProgress(100);
+            }
+            break;
+          }
+          default: {
+            this.logger.warn(`Unknown sync job name: "${jobName}", using default user repositories sync handler`);
+            syncData = await processor.syncUserRepositories(
+              job.data as SyncUserRepositoriesPayload,
+              {},
+              undefined,
+              async (progressUpdate) => {
+                if (typeof job.updateProgress === 'function') {
+                  await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+                }
+              },
+            );
+          }
+        }
+
+        // Mark SyncRun as COMPLETED
+        try {
+          if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+            await prisma.syncRun.updateMany({
+              where: {
+                OR: [{ id: syncId }, { jobId: String(job.id) }],
+              },
+              data: {
+                status: 'COMPLETED',
+                completedAt: new Date(),
+                lastProcessedAt: new Date(),
+                totalItems: syncData?.totalCount ?? 0,
+                processedItems: syncData?.totalCount ?? 0,
+              },
+            });
+          }
+        } catch (err: any) {
+          this.logger.debug(`Could not update SyncRun to COMPLETED: ${err?.message}`);
+        }
+
+        return {
+          success: true,
+          jobName,
+          processedAt: new Date().toISOString(),
+          details: {
+            jobId: job.id,
+            syncId,
+            userId,
+            scope: (job.data as any)?.scope,
+            totalCount: syncData?.totalCount,
+          },
+          data: syncData,
+        };
+      } catch (error: any) {
+        // Mark SyncRun as FAILED on error
+        try {
+          if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+            await prisma.syncRun.updateMany({
+              where: {
+                OR: [{ id: syncId }, { jobId: String(job.id) }],
+              },
+              data: {
+                status: 'FAILED',
+                errorMessage: error?.message || 'Sync execution failed',
+                lastProcessedAt: new Date(),
+              },
+            });
+          }
+        } catch {
+          // ignore
+        }
+        throw error;
+      }
     });
   }
 }
