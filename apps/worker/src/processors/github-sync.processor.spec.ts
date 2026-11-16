@@ -283,6 +283,66 @@ async function runTests() {
     console.log('  ✔ Malformed fullName formats rejected cleanly\n');
   }
 
+  // Test 7: Multi-page repository synchronization with pagination and progress reporting
+  {
+    console.log('Test 7: Multi-page repository synchronization with pagination and progress reporting');
+    const page1Repos: any[] = Array.from({ length: 100 }, (_, i) => ({
+      id: 1000 + i,
+      name: `repo-p1-${i}`,
+      full_name: `org/repo-p1-${i}`,
+      private: false,
+    }));
+    const page2Repos: any[] = Array.from({ length: 35 }, (_, i) => ({
+      id: 2000 + i,
+      name: `repo-p2-${i}`,
+      full_name: `org/repo-p2-${i}`,
+      private: false,
+    }));
+
+    const requestedPages: number[] = [];
+    const mockPaginatedClient = {
+      repositories: {
+        listForAuthenticatedUser: async (params: any) => {
+          requestedPages.push(params.page);
+          if (params.page === 1) return page1Repos;
+          if (params.page === 2) return page2Repos;
+          return [];
+        },
+      },
+    } as any;
+
+    const reportedProgress: any[] = [];
+    const payload = {
+      userId: 'user-paged',
+      workspaceId: 'ws-paged',
+      githubAccountId: 'gh-acc-paged',
+      syncId: 'sync-paged-1',
+      scope: 'all',
+    };
+
+    const paginatedResult = await processor.syncUserRepositories(
+      payload,
+      {},
+      mockPaginatedClient,
+      async (prog) => {
+        reportedProgress.push({ ...prog });
+      },
+    );
+
+    assert.deepStrictEqual(requestedPages, [1, 2], 'Should request page 1 and page 2 sequentially');
+    assert.strictEqual(paginatedResult.totalCount, 135, 'Total repositories should sum both pages');
+    assert.strictEqual(paginatedResult.pagesProcessed, 2, 'Should process 2 pages');
+    assert.strictEqual(reportedProgress.length, 2, 'Should report progress for both pages');
+    assert.strictEqual(reportedProgress[0].page, 1);
+    assert.strictEqual(reportedProgress[0].totalProcessed, 100);
+    assert.strictEqual(reportedProgress[0].hasMore, true);
+    assert.strictEqual(reportedProgress[1].page, 2);
+    assert.strictEqual(reportedProgress[1].totalProcessed, 135);
+    assert.strictEqual(reportedProgress[1].hasMore, false);
+    assert.strictEqual(reportedProgress[1].percentage, 100);
+    console.log('  ✔ Pagination processes all pages and streams progress events accurately\n');
+  }
+
   console.log('✅ ALL GITHUB SYNC PROCESSOR TESTS PASSED!\n');
 }
 
