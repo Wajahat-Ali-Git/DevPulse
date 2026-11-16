@@ -21,6 +21,8 @@ export interface FailedJobDetails {
   attemptsMade: number;
   maxAttempts: number;
   isPermanent: boolean;
+  isRateLimit?: boolean;
+  isTransient?: boolean;
   errorMessage: string;
   failedReason?: string;
   stack?: string;
@@ -119,9 +121,11 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
               const normalized = normalizeJobError(rawError);
               const isRetryable = isRetryableError(rawError);
               const isPermanent = !isRetryable;
+              const isRateLimit = (rawError as any)?.isRateLimit === true || (rawError as any)?.isRateLimitExceeded === true;
+              const isTransient = (rawError as any)?.isTransient === true;
 
               this.logger.warn(
-                `Job execution [${job.id}] "${job.name}" failed after ${durationMs}ms with ${isPermanent ? 'PERMANENT' : 'RETRYABLE'} failure: ${normalized.message}`,
+                `Job execution [${job.id}] "${job.name}" failed after ${durationMs}ms with ${isPermanent ? 'PERMANENT' : isRateLimit ? 'RATE_LIMIT' : 'TRANSIENT/RETRYABLE'} failure: ${normalized.message}`,
                 {
                   jobId: job.id,
                   jobName: job.name,
@@ -131,6 +135,8 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
                   attemptsMade: job.attemptsMade,
                   maxAttempts: job.opts?.attempts ?? 1,
                   isPermanent,
+                  isRateLimit,
+                  isTransient,
                   error: normalized.message,
                   stack: normalized.stack,
                 },
@@ -144,6 +150,8 @@ export abstract class BaseWorker<DataType = any, ResultType = any> implements On
                 attemptsMade: job.attemptsMade + 1,
                 maxAttempts: job.opts?.attempts ?? 1,
                 isPermanent,
+                isRateLimit,
+                isTransient,
                 errorMessage: normalized.message,
                 failedReason: normalized.message,
                 stack: normalized.stack,
