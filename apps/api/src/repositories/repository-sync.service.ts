@@ -137,6 +137,29 @@ export class RepositorySyncService implements OnModuleDestroy {
     const initiatedAt = new Date().toISOString();
     const jobIdStr = String(job.id);
 
+    // Persist SyncRun record in database for persistent tracking
+    try {
+      if (prisma && prisma.syncRun && typeof prisma.syncRun.create === 'function') {
+        await prisma.syncRun.create({
+          data: {
+            id: syncId,
+            userId,
+            githubAccountId: gitHubAccount.id,
+            jobId: jobIdStr,
+            type: 'USER_REPOSITORIES',
+            status: 'QUEUED',
+            workspaceId: dto.workspaceId,
+            correlationId,
+            scope: typeof scope === 'string' ? scope : 'all',
+            totalItems: 0,
+            processedItems: 0,
+          },
+        });
+      }
+    } catch (err: any) {
+      this.logger.warn(`Failed to persist SyncRun record for sync ${syncId}: ${err?.message}`);
+    }
+
     this.logger.info(
       `Enqueued repository sync job [${jobIdStr}] for user ${userId} (account: ${gitHubAccount.username}, workspace: ${dto.workspaceId}, corr: ${correlationId})`,
       {
@@ -185,23 +208,56 @@ export class RepositorySyncService implements OnModuleDestroy {
    * Retrieves tracking and status information for an enqueued synchronization job.
    */
   async getSyncJobStatus(syncOrJobId: string): Promise<SyncJobStatusResponseDto> {
+    const prisma = this.databaseService?.client;
     const queue = this.getSyncQueue();
-    const job = await queue.getJob(syncOrJobId);
+    let job = await queue.getJob(syncOrJobId);
 
-    if (!job) {
+    // If job not found in BullMQ, check Prisma SyncRun table
+    let syncRunRecord: any = null;
+    if (prisma && prisma.syncRun && typeof prisma.syncRun.findFirst === 'function') {
+      try {
+        syncRunRecord = await prisma.syncRun.findFirst({
+          where: {
+            OR: [{ id: syncOrJobId }, { jobId: syncOrJobId }],
+          },
+        });
+      } catch (err: any) {
+        this.logger.debug(`Could not query syncRun: ${err?.message}`);
+      }
+    }
+
+    if (!job && !syncRunRecord) {
       throw new ResourceNotFoundException(`Synchronization job with ID ${syncOrJobId} not found`);
     }
 
-    const state = await job.getState();
-    const attemptsMade = job.attemptsMade ?? 0;
-    const progress = typeof job.progress === 'number' ? job.progress : undefined;
-    const jobIdStr = String(job.id);
-    const userId = job.data?.userId;
-    const workspaceId = job.data?.workspaceId;
+    let state = 'unknown';
+    let attemptsMade = 0;
+    let progress: number | undefined = undefined;
+    let jobIdStr = syncOrJobId;
+    let userId: string | undefined = syncRunRecord?.userId;
+    let workspaceId: string | undefined = syncRunRecord?.workspaceId;
+    let jobReturnValue: any = undefined;
+    let failedReason: string | null = syncRunRecord?.errorMessage ?? null;
+    let createdAt: string | undefined = syncRunRecord?.createdAt ? new Date(syncRunRecord.createdAt).toISOString() : undefined;
+    let processedAt: string | undefined = syncRunRecord?.startedAt ? new Date(syncRunRecord.startedAt).toISOString() : undefined;
+    let finishedAt: string | undefined = syncRunRecord?.completedAt ? new Date(syncRunRecord.completedAt).toISOString() : undefined;
 
-    const createdAt = job.timestamp ? new Date(job.timestamp).toISOString() : undefined;
-    const processedAt = job.processedOn ? new Date(job.processedOn).toISOString() : undefined;
-    const finishedAt = job.finishedOn ? new Date(job.finishedOn).toISOString() : undefined;
+    if (job) {
+      state = await job.getState();
+      attemptsMade = job.attemptsMade ?? 0;
+      progress = typeof job.progress === 'number' ? job.progress : undefined;
+      jobIdStr = String(job.id);
+      userId = job.data?.userId ?? userId;
+      workspaceId = job.data?.workspaceId ?? workspaceId;
+      jobReturnValue = job.returnvalue;
+      failedReason = job.failedReason ?? failedReason;
+      createdAt = job.timestamp ? new Date(job.timestamp).toISOString() : createdAt;
+      processedAt = job.processedOn ? new Date(job.processedOn).toISOString() : processedAt;
+      finishedAt = job.finishedOn ? new Date(job.finishedOn).toISOString() : finishedAt;
+    } else if (syncRunRecord) {
+      state = syncRunRecord.status.toLowerCase();
+      jobIdStr = syncRunRecord.jobId || syncRunRecord.id;
+    }
 
     // Update history entry if present
     const existing = this.syncHistory.find((h) => h.syncId === jobIdStr || h.jobId === jobIdStr);
@@ -209,22 +265,22 @@ export class RepositorySyncService implements OnModuleDestroy {
       existing.status = state;
       existing.processedAt = processedAt;
       existing.finishedAt = finishedAt;
-      if (job.finishedOn && job.processedOn) {
+      if (job?.finishedOn && job?.processedOn) {
         existing.durationMs = job.finishedOn - job.processedOn;
       }
-      existing.error = job.failedReason ?? null;
-      existing.result = job.returnvalue;
+      existing.error = failedReason ?? null;
+      existing.result = jobReturnValue;
     }
 
     return {
       syncId: jobIdStr,
       jobId: jobIdStr,
       queueName: QueueName.REPOSITORY_SYNC,
-      jobName: job.name,
+      jobName: job?.name || JobName.SYNC_USER_REPOSITORIES,
       status: state as any,
       progress,
-      result: job.returnvalue,
-      error: job.failedReason ?? null,
+      result: jobReturnValue,
+      error: failedReason ?? null,
       attemptsMade,
       userId,
       workspaceId,
@@ -272,6 +328,43 @@ export class RepositorySyncService implements OnModuleDestroy {
     }
 
     const limit = Math.min(Math.max(filter.limit ?? 20, 1), 100);
+
+    // Try fetching from database SyncRun table first
+    if (prisma && prisma.syncRun && typeof prisma.syncRun.findMany === 'function') {
+      try {
+        const whereClause: any = {
+          workspaceId: { in: allowedWorkspaceIds },
+        };
+        if (filter.status) {
+          whereClause.status = filter.status.toUpperCase();
+        }
+
+        const dbRuns = await prisma.syncRun.findMany({
+          where: whereClause,
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+        });
+
+        if (dbRuns && dbRuns.length > 0) {
+          return dbRuns.map((run: any) => ({
+            syncId: run.id,
+            jobId: run.jobId || run.id,
+            jobName: JobName.SYNC_USER_REPOSITORIES,
+            queueName: QueueName.REPOSITORY_SYNC,
+            status: run.status.toLowerCase(),
+            workspaceId: run.workspaceId,
+            userId: run.userId,
+            enqueuedAt: run.createdAt ? new Date(run.createdAt).toISOString() : new Date().toISOString(),
+            processedAt: run.startedAt ? new Date(run.startedAt).toISOString() : undefined,
+            finishedAt: run.completedAt ? new Date(run.completedAt).toISOString() : undefined,
+            error: run.errorMessage ?? null,
+            result: run.processedItems ? { totalCount: run.processedItems } : undefined,
+          }));
+        }
+      } catch (err: any) {
+        this.logger.debug(`Could not query syncRun history from database: ${err?.message}`);
+      }
+    }
 
     return this.syncHistory
       .filter((item) => {
