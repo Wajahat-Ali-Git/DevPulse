@@ -47,6 +47,9 @@ importers:
       '@types/jsonwebtoken':
         specifier: ^9.0.10
         version: 9.0.10
+      bullmq:
+        specifier: ^6.3.11
+        version: 6.3.11(ioredis@6.0.0)
       class-transformer:
         specifier: ^0.5.1
         version: 0.5.1

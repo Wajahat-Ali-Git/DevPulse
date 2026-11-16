@@ -41,6 +41,41 @@ export class RetryableJobError extends Error {
 }
 
 /**
+ * Specialized error class for Rate Limit failures with reset/retry-after telemetry.
+ */
+export class RateLimitJobError extends RetryableJobError {
+  public readonly isRateLimit = true;
+
+  constructor(
+    message: string,
+    public readonly resetEpochSeconds?: number,
+    retryAfterMs: number = 60000,
+    originalError?: unknown,
+  ) {
+    super(message, retryAfterMs, originalError);
+    this.name = 'RateLimitJobError';
+    Object.setPrototypeOf(this, RateLimitJobError.prototype);
+  }
+}
+
+/**
+ * Specialized error class for Transient network or service disruptions.
+ */
+export class TransientJobError extends RetryableJobError {
+  public readonly isTransient = true;
+
+  constructor(
+    message: string,
+    public readonly statusCode: number = 503,
+    originalError?: unknown,
+  ) {
+    super(message, 2000, originalError);
+    this.name = 'TransientJobError';
+    Object.setPrototypeOf(this, TransientJobError.prototype);
+  }
+}
+
+/**
  * Determines whether a given failure is retryable or permanent.
  *
  * Permanent Failures (should NOT retry):

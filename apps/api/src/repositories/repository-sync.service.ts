@@ -1,25 +1,431 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Queue, ConnectionOptions } from 'bullmq';
 import { DatabaseService } from '../database.service';
+import { RedisService } from '../redis.service';
+import { RepositorySyncQueueService } from './repository-sync-queue.service';
 import { GitHubClient, GitHubNotFoundError, GitHubForbiddenError, GitHubRepository } from '@devpulse/github';
 import { RepositoryStatus } from '@devpulse/database';
 import { Logger } from '@devpulse/logger';
-import { ResourceNotFoundException, AuthorizationException } from '../common/errors';
+import { QueueName, JobName, SyncUserRepositoriesPayload } from '@devpulse/types';
+import { ResourceNotFoundException, AuthorizationException, ConflictException } from '../common/errors';
 import {
   SyncRepositoryResult,
   SyncRepositoryOptions,
   SyncExecutionRecord,
   ListRepositoriesFilter,
   PaginatedRepositoriesResponse,
+  InitiateSyncRequestDto,
+  InitiateSyncResponseDto,
+  SyncJobStatusResponseDto,
+  SyncHistoryFilter,
+  SyncHistoryItemDto,
 } from './types';
 
 @Injectable()
-export class RepositorySyncService {
+export class RepositorySyncService implements OnModuleDestroy {
   private readonly logger = new Logger({ service: 'api', context: RepositorySyncService.name });
 
   // In-memory sync telemetry tracking last successful sync timestamp and error per repository
   private readonly syncStateMap = new Map<string, { lastSyncedAt?: Date; lastSyncError?: string | null }>();
 
-  constructor(private readonly databaseService: DatabaseService) {}
+  // In-memory sync history tracking recent repository synchronization jobs
+  private readonly syncHistory: SyncHistoryItemDto[] = [];
+
+  // Lazily initialized BullMQ queue for repository synchronization
+  private syncQueue?: Queue;
+
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly redisService?: RedisService,
+    private readonly syncQueueService?: RepositorySyncQueueService,
+  ) {}
+
+  /**
+   * Returns or lazily creates the BullMQ queue for repository synchronization.
+   */
+  private getSyncQueue(): Queue {
+    if (this.syncQueueService) {
+      return this.syncQueueService.getQueue();
+    }
+    if (!this.syncQueue) {
+      const connection = this.redisService?.client as any;
+      this.syncQueue = new Queue(QueueName.REPOSITORY_SYNC, {
+        connection,
+      });
+    }
+    return this.syncQueue;
+  }
+
+  /**
+   * Enqueues an asynchronous repository synchronization job.
+   * Validates that the requested GitHub account exists and belongs to the authenticated user.
+   * Also verifies user workspace membership.
+   */
+  async enqueueRepositorySync(
+    userId: string,
+    dto: InitiateSyncRequestDto,
+  ): Promise<InitiateSyncResponseDto> {
+    const prisma = this.databaseService.client;
+
+    // 1. Enforce user-level data isolation on workspace
+    await this.verifyUserWorkspaceAccess(userId, dto.workspaceId);
+
+    // 2. Validate that the requested GitHub account belongs to the authenticated user
+    let gitHubAccount;
+    if (dto.githubAccountId) {
+      gitHubAccount = await prisma.gitHubAccount.findFirst({
+        where: {
+          id: dto.githubAccountId,
+        },
+      });
+
+      if (!gitHubAccount) {
+        throw new ResourceNotFoundException('Requested GitHub account was not found');
+      }
+
+      if (gitHubAccount.userId !== userId) {
+        this.logger.warn(
+          `User ${userId} attempted to initiate sync with foreign GitHub account ${dto.githubAccountId} owned by ${gitHubAccount.userId}`,
+        );
+        throw new AuthorizationException(
+          'The requested GitHub account does not belong to the authenticated user',
+        );
+      }
+    } else {
+      // Find the user's primary linked GitHub account
+      gitHubAccount = await prisma.gitHubAccount.findFirst({
+        where: {
+          userId,
+        },
+      });
+
+      if (!gitHubAccount) {
+        throw new ResourceNotFoundException(
+          'No linked GitHub account found for the authenticated user. Please connect a GitHub account first.',
+        );
+      }
+    }
+
+    // 3. Prevent duplicate active synchronization jobs for the same account and scope (unless forced)
+    const scope = dto.scope || 'all';
+    if (!dto.forced) {
+      // Check in-memory sync history for active job on same account/scope
+      const activeInMemory = this.syncHistory.find(
+        (h) =>
+          h.githubAccountId === gitHubAccount.id &&
+          (h.scope || 'all') === scope &&
+          (h.status === 'enqueued' || h.status === 'processing' || h.status === 'waiting' || h.status === 'active'),
+      );
+      if (activeInMemory) {
+        throw new ConflictException(
+          `A synchronization job is already active for this GitHub account and scope (${scope}). Wait for it to complete or provide forced=true to override.`,
+          { activeSyncId: activeInMemory.syncId, githubAccountId: gitHubAccount.id, scope },
+        );
+      }
+
+      // Check database SyncRun table for active jobs (QUEUED or PROCESSING)
+      if (prisma && prisma.syncRun && typeof prisma.syncRun.findFirst === 'function') {
+        try {
+          const activeDbRun = await prisma.syncRun.findFirst({
+            where: {
+              githubAccountId: gitHubAccount.id,
+              scope,
+              status: { in: ['QUEUED', 'PROCESSING'] },
+            },
+          });
+          if (activeDbRun) {
+            throw new ConflictException(
+              `A synchronization job is already active for this GitHub account and scope (${scope}). Wait for it to complete or provide forced=true to override.`,
+              { activeSyncId: activeDbRun.id, githubAccountId: gitHubAccount.id, scope },
+            );
+          }
+        } catch (err: any) {
+          if (err instanceof ConflictException) throw err;
+          this.logger.debug(`Could not check active db sync runs: ${err?.message}`);
+        }
+      }
+    }
+
+    // 4. Construct job payload and correlation tracking
+    const correlationId = `sync_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const syncId = correlationId;
+    const payload: SyncUserRepositoriesPayload & { correlationId: string } = {
+      userId,
+      workspaceId: dto.workspaceId,
+      githubAccountId: gitHubAccount.id,
+      syncId,
+      scope,
+      forced: dto.forced ?? false,
+      correlationId,
+    };
+
+    // 5. Enqueue via dedicated RepositorySyncQueueService or fallback queue
+    let job: any;
+    if (this.syncQueueService) {
+      job = await this.syncQueueService.addSyncUserRepositoriesJob(payload, {
+        jobId: syncId,
+        correlationId,
+      });
+    } else {
+      const queue = this.getSyncQueue();
+      job = await queue.add(JobName.SYNC_USER_REPOSITORIES, payload, {
+        jobId: syncId,
+      });
+    }
+
+    const initiatedAt = new Date().toISOString();
+    const jobIdStr = String(job.id);
+
+    // Persist SyncRun record in database for persistent tracking
+    try {
+      if (prisma && prisma.syncRun && typeof prisma.syncRun.create === 'function') {
+        await prisma.syncRun.create({
+          data: {
+            id: syncId,
+            userId,
+            githubAccountId: gitHubAccount.id,
+            jobId: jobIdStr,
+            type: 'USER_REPOSITORIES',
+            status: 'QUEUED',
+            workspaceId: dto.workspaceId,
+            correlationId,
+            scope: typeof scope === 'string' ? scope : 'all',
+            totalItems: 0,
+            processedItems: 0,
+          },
+        });
+      }
+    } catch (err: any) {
+      this.logger.warn(`Failed to persist SyncRun record for sync ${syncId}: ${err?.message}`);
+    }
+
+    this.logger.info(
+      `Enqueued repository sync job [${jobIdStr}] for user ${userId} (account: ${gitHubAccount.username}, workspace: ${dto.workspaceId}, corr: ${correlationId})`,
+      {
+        jobId: jobIdStr,
+        userId,
+        workspaceId: dto.workspaceId,
+        githubAccountId: gitHubAccount.id,
+        username: gitHubAccount.username,
+        correlationId,
+      },
+    );
+
+    // Record into sync history
+    this.recordSyncHistory({
+      syncId: jobIdStr,
+      jobId: jobIdStr,
+      jobName: JobName.SYNC_USER_REPOSITORIES,
+      queueName: QueueName.REPOSITORY_SYNC,
+      status: 'enqueued',
+      workspaceId: dto.workspaceId,
+      userId,
+      enqueuedAt: initiatedAt,
+      githubAccountId: gitHubAccount.id,
+      scope,
+    });
+
+    return {
+      syncId: jobIdStr,
+      jobId: jobIdStr,
+      queueName: QueueName.REPOSITORY_SYNC,
+      jobName: JobName.SYNC_USER_REPOSITORIES,
+      status: 'enqueued',
+      initiatedAt,
+      githubAccountId: gitHubAccount.id,
+      workspaceId: dto.workspaceId,
+      userId,
+      scope,
+      tracking: {
+        checkStatusUrl: `/api/v1/sync/${jobIdStr}`,
+        correlationId,
+        pollingIntervalMs: 2000,
+        estimatedTimeoutMs: 120000,
+      },
+    };
+  }
+
+  /**
+   * Retrieves tracking and status information for an enqueued synchronization job.
+   */
+  async getSyncJobStatus(syncOrJobId: string): Promise<SyncJobStatusResponseDto> {
+    const prisma = this.databaseService?.client;
+    const queue = this.getSyncQueue();
+    let job = await queue.getJob(syncOrJobId);
+
+    // If job not found in BullMQ, check Prisma SyncRun table
+    let syncRunRecord: any = null;
+    if (prisma && prisma.syncRun && typeof prisma.syncRun.findFirst === 'function') {
+      try {
+        syncRunRecord = await prisma.syncRun.findFirst({
+          where: {
+            OR: [{ id: syncOrJobId }, { jobId: syncOrJobId }],
+          },
+        });
+      } catch (err: any) {
+        this.logger.debug(`Could not query syncRun: ${err?.message}`);
+      }
+    }
+
+    if (!job && !syncRunRecord) {
+      throw new ResourceNotFoundException(`Synchronization job with ID ${syncOrJobId} not found`);
+    }
+
+    let state = 'unknown';
+    let attemptsMade = 0;
+    let progress: number | undefined = undefined;
+    let jobIdStr = syncOrJobId;
+    let userId: string | undefined = syncRunRecord?.userId;
+    let workspaceId: string | undefined = syncRunRecord?.workspaceId;
+    let jobReturnValue: any = undefined;
+    let failedReason: string | null = syncRunRecord?.errorMessage ?? null;
+    let createdAt: string | undefined = syncRunRecord?.createdAt ? new Date(syncRunRecord.createdAt).toISOString() : undefined;
+    let processedAt: string | undefined = syncRunRecord?.startedAt ? new Date(syncRunRecord.startedAt).toISOString() : undefined;
+    let finishedAt: string | undefined = syncRunRecord?.completedAt ? new Date(syncRunRecord.completedAt).toISOString() : undefined;
+
+    if (job) {
+      state = await job.getState();
+      attemptsMade = job.attemptsMade ?? 0;
+      progress = typeof job.progress === 'number' ? job.progress : undefined;
+      jobIdStr = String(job.id);
+      userId = job.data?.userId ?? userId;
+      workspaceId = job.data?.workspaceId ?? workspaceId;
+      jobReturnValue = job.returnvalue;
+      failedReason = job.failedReason ?? failedReason;
+      createdAt = job.timestamp ? new Date(job.timestamp).toISOString() : createdAt;
+      processedAt = job.processedOn ? new Date(job.processedOn).toISOString() : processedAt;
+      finishedAt = job.finishedOn ? new Date(job.finishedOn).toISOString() : finishedAt;
+    } else if (syncRunRecord) {
+      state = syncRunRecord.status.toLowerCase();
+      jobIdStr = syncRunRecord.jobId || syncRunRecord.id;
+    }
+
+    // Update history entry if present
+    const existing = this.syncHistory.find((h) => h.syncId === jobIdStr || h.jobId === jobIdStr);
+    if (existing) {
+      existing.status = state;
+      existing.processedAt = processedAt;
+      existing.finishedAt = finishedAt;
+      if (job?.finishedOn && job?.processedOn) {
+        existing.durationMs = job.finishedOn - job.processedOn;
+      }
+      existing.error = failedReason ?? null;
+      existing.result = jobReturnValue;
+    }
+
+    return {
+      syncId: jobIdStr,
+      jobId: jobIdStr,
+      queueName: QueueName.REPOSITORY_SYNC,
+      jobName: job?.name || JobName.SYNC_USER_REPOSITORIES,
+      status: state as any,
+      progress,
+      result: jobReturnValue,
+      error: failedReason ?? null,
+      attemptsMade,
+      userId,
+      workspaceId,
+      createdAt,
+      processedAt,
+      finishedAt,
+    };
+  }
+
+  /**
+   * Records or updates a sync item in the in-memory sync history.
+   */
+  recordSyncHistory(item: SyncHistoryItemDto): void {
+    const index = this.syncHistory.findIndex((h) => h.syncId === item.syncId || h.jobId === item.jobId);
+    if (index >= 0) {
+      this.syncHistory[index] = { ...this.syncHistory[index], ...item };
+    } else {
+      // Keep most recent items at the front, cap history buffer at 500
+      this.syncHistory.unshift(item);
+      if (this.syncHistory.length > 500) {
+        this.syncHistory.pop();
+      }
+    }
+  }
+
+  /**
+   * Retrieves synchronization history filtered by authorized workspaces and options.
+   */
+  async getSyncHistory(
+    userId: string,
+    filter: SyncHistoryFilter = {},
+  ): Promise<SyncHistoryItemDto[]> {
+    const prisma = this.databaseService.client;
+
+    let allowedWorkspaceIds: string[];
+    if (filter.workspaceId) {
+      await this.verifyUserWorkspaceAccess(userId, filter.workspaceId);
+      allowedWorkspaceIds = [filter.workspaceId];
+    } else {
+      const memberships = await prisma.workspaceMember.findMany({
+        where: { userId },
+        select: { workspaceId: true },
+      });
+      allowedWorkspaceIds = memberships.map((m: { workspaceId: string }) => m.workspaceId);
+    }
+
+    const limit = Math.min(Math.max(filter.limit ?? 20, 1), 100);
+
+    // Try fetching from database SyncRun table first
+    if (prisma && prisma.syncRun && typeof prisma.syncRun.findMany === 'function') {
+      try {
+        const whereClause: any = {
+          workspaceId: { in: allowedWorkspaceIds },
+        };
+        if (filter.status) {
+          whereClause.status = filter.status.toUpperCase();
+        }
+
+        const dbRuns = await prisma.syncRun.findMany({
+          where: whereClause,
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+        });
+
+        if (dbRuns && dbRuns.length > 0) {
+          return dbRuns.map((run: any) => ({
+            syncId: run.id,
+            jobId: run.jobId || run.id,
+            jobName: JobName.SYNC_USER_REPOSITORIES,
+            queueName: QueueName.REPOSITORY_SYNC,
+            status: run.status.toLowerCase(),
+            workspaceId: run.workspaceId,
+            userId: run.userId,
+            enqueuedAt: run.createdAt ? new Date(run.createdAt).toISOString() : new Date().toISOString(),
+            processedAt: run.startedAt ? new Date(run.startedAt).toISOString() : undefined,
+            finishedAt: run.completedAt ? new Date(run.completedAt).toISOString() : undefined,
+            error: run.errorMessage ?? null,
+            result: run.processedItems ? { totalCount: run.processedItems } : undefined,
+          }));
+        }
+      } catch (err: any) {
+        this.logger.debug(`Could not query syncRun history from database: ${err?.message}`);
+      }
+    }
+
+    return this.syncHistory
+      .filter((item) => {
+        if (!allowedWorkspaceIds.includes(item.workspaceId)) {
+          return false;
+        }
+        if (filter.status && item.status.toLowerCase() !== filter.status.toLowerCase()) {
+          return false;
+        }
+        return true;
+      })
+      .slice(0, limit);
+  }
+
+  async onModuleDestroy() {
+    if (this.syncQueue) {
+      await this.syncQueue.close();
+    }
+  }
+
 
   /**
    * Enforces user-level data isolation.
