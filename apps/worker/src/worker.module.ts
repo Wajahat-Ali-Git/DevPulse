@@ -8,6 +8,7 @@ import {
   SampleWorker,
 } from './queues';
 import { SampleProcessor } from './processors/sample.processor';
+import { GitHubSyncProcessor } from './processors/github-sync.processor';
 import { SchedulerService } from './scheduler/scheduler.service';
 
 @Module({
@@ -20,6 +21,7 @@ import { SchedulerService } from './scheduler/scheduler.service';
     MetricsWorker,
     SampleWorker,
     SampleProcessor,
+    GitHubSyncProcessor,
     SchedulerService,
   ],
   exports: [
@@ -30,6 +32,7 @@ import { SchedulerService } from './scheduler/scheduler.service';
     MetricsWorker,
     SampleWorker,
     SampleProcessor,
+    GitHubSyncProcessor,
     SchedulerService,
   ],
 })
