@@ -197,3 +197,4 @@ Retrieves historical synchronization runs for workspaces the authenticated user 
 
 5. **Graceful Shutdown**:
    - During SIGTERM or module teardown, workers pause intake and wait for active jobs to complete cleanly before disconnecting from Redis.
+
