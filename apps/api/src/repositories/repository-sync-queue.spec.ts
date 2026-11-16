@@ -263,9 +263,13 @@ async function runTests() {
     assert.ok(delegatedPayload !== null, 'addSyncUserRepositoriesJob should have been called');
     assert.strictEqual(delegatedPayload.userId, 'user-alice');
     assert.strictEqual(delegatedPayload.workspaceId, 'ws-1');
+    assert.strictEqual(delegatedPayload.githubAccountId, 'gh-alice');
+    assert.ok(delegatedPayload.syncId);
+    assert.strictEqual(delegatedPayload.scope, 'all');
     assert.ok(delegatedPayload.correlationId, 'Correlation ID should be present in payload');
     assert.strictEqual(result.status, 'enqueued');
     assert.ok(result.syncId);
+    assert.strictEqual(result.scope, 'all');
     console.log('  ✔ RepositorySyncService delegates to RepositorySyncQueueService when injected\n');
   }
 

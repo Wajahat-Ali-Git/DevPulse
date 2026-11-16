@@ -620,6 +620,9 @@ async function runTests() {
     assert.strictEqual(enqueuedPayload.userId, 'user-alice');
     assert.strictEqual(enqueuedPayload.workspaceId, 'ws-test');
     assert.strictEqual(enqueuedPayload.forced, true);
+    assert.strictEqual(enqueuedPayload.githubAccountId, 'gh-acc-1');
+    assert.ok(enqueuedPayload.syncId);
+    assert.strictEqual(enqueuedPayload.scope, 'all');
     console.log('  ✔ Successfully initiated sync, enqueued BullMQ job, and returned tracking metadata\n');
   }
 
