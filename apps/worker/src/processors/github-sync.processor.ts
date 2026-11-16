@@ -17,6 +17,14 @@ export interface GitHubSyncProcessorOptions {
   maxRetries?: number;
 }
 
+export interface SyncRepositoriesProgress {
+  page: number;
+  perPage: number;
+  totalProcessed: number;
+  hasMore: boolean;
+  percentage?: number;
+}
+
 export interface SyncRepositoriesResult {
   repositories: GitHubRepository[];
   totalCount: number;
@@ -24,6 +32,8 @@ export interface SyncRepositoriesResult {
   userId?: string;
   githubAccountId?: string;
   scope?: string;
+  pagesProcessed?: number;
+  progressHistory?: SyncRepositoriesProgress[];
 }
 
 export interface SyncCommitsResult {
@@ -71,17 +81,22 @@ export class GitHubSyncProcessor {
   }
 
   /**
-   * Synchronizes repositories for an authenticated user using GitHubRepositoriesApi.
+   * Synchronizes repositories for an authenticated user using GitHubRepositoriesApi
+   * with full pagination support and progress reporting.
    */
   async syncUserRepositories(
     payload: SyncUserRepositoriesPayload | RepositorySyncJobPayload,
     clientOptions: GitHubSyncProcessorOptions = {},
     customClient?: GitHubClient,
+    onProgress?: (progress: SyncRepositoriesProgress) => Promise<void> | void,
   ): Promise<SyncRepositoriesResult> {
     const client = customClient || this.createGitHubClient(clientOptions);
+    const perPage = 100;
+    const allRepos: GitHubRepository[] = [];
+    const progressHistory: SyncRepositoriesProgress[] = [];
 
     this.logger.info(
-      `Invoking GitHub API to fetch repositories for user "${payload.userId}" (scope: ${payload.scope || 'all'})`,
+      `Invoking GitHub API to fetch repositories with pagination for user "${payload.userId}" (scope: ${payload.scope || 'all'})`,
       {
         userId: payload.userId,
         githubAccountId: (payload as any).githubAccountId,
@@ -90,28 +105,74 @@ export class GitHubSyncProcessor {
       },
     );
 
-    const repos = await client.repositories.listForAuthenticatedUser({
-      visibility: 'all',
-      sort: 'updated',
-      direction: 'desc',
-      per_page: 100,
-    });
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const pageRepos = await client.repositories.listForAuthenticatedUser({
+        visibility: 'all',
+        sort: 'updated',
+        direction: 'desc',
+        per_page: perPage,
+        page,
+      });
+
+      const count = pageRepos ? pageRepos.length : 0;
+      if (count > 0) {
+        allRepos.push(...pageRepos);
+      }
+
+      hasMore = count === perPage;
+
+      const progressUpdate: SyncRepositoriesProgress = {
+        page,
+        perPage,
+        totalProcessed: allRepos.length,
+        hasMore,
+        percentage: hasMore ? Math.min(page * 25, 95) : 100,
+      };
+      progressHistory.push(progressUpdate);
+
+      if (onProgress) {
+        try {
+          await onProgress(progressUpdate);
+        } catch (err: any) {
+          this.logger.warn(`Failed to report sync progress update for page ${page}: ${err?.message}`);
+        }
+      }
+
+      this.logger.info(
+        `Retrieved page ${page} of repositories (${count} items, total so far: ${allRepos.length}) for user "${payload.userId}"`,
+        {
+          userId: payload.userId,
+          page,
+          pageCount: count,
+          totalCount: allRepos.length,
+          hasMore,
+        },
+      );
+
+      page++;
+    }
 
     this.logger.info(
-      `Successfully retrieved ${repos.length} repositories from GitHub for user "${payload.userId}"`,
+      `Completed repository synchronization across ${page - 1} page(s), total: ${allRepos.length} repositories for user "${payload.userId}"`,
       {
         userId: payload.userId,
-        count: repos.length,
+        pagesProcessed: page - 1,
+        totalCount: allRepos.length,
       },
     );
 
     return {
-      repositories: repos,
-      totalCount: repos.length,
+      repositories: allRepos,
+      totalCount: allRepos.length,
       syncId: (payload as any).syncId,
       userId: payload.userId,
       githubAccountId: (payload as any).githubAccountId,
       scope: payload.scope || 'all',
+      pagesProcessed: page - 1,
+      progressHistory,
     };
   }
 

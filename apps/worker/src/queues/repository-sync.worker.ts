@@ -65,24 +65,51 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
 
       switch (jobName) {
         case JobName.SYNC_USER_REPOSITORIES: {
-          syncData = await processor.syncUserRepositories(job.data as SyncUserRepositoriesPayload);
+          syncData = await processor.syncUserRepositories(
+            job.data as SyncUserRepositoriesPayload,
+            {},
+            undefined,
+            async (progressUpdate) => {
+              if (typeof job.updateProgress === 'function') {
+                await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+              }
+            },
+          );
           break;
         }
         case JobName.SYNC_SINGLE_REPOSITORY: {
           syncData = await processor.syncSingleRepository(job.data as SyncSingleRepositoryPayload);
+          if (typeof job.updateProgress === 'function') {
+            await job.updateProgress(100);
+          }
           break;
         }
         case JobName.SYNC_REPOSITORY_COMMITS: {
           syncData = await processor.syncRepositoryCommits(job.data as SyncRepositoryCommitsPayload);
+          if (typeof job.updateProgress === 'function') {
+            await job.updateProgress(100);
+          }
           break;
         }
         case JobName.SYNC_REPOSITORY_PULL_REQUESTS: {
           syncData = await processor.syncRepositoryPullRequests(job.data as SyncRepositoryPullRequestsPayload);
+          if (typeof job.updateProgress === 'function') {
+            await job.updateProgress(100);
+          }
           break;
         }
         default: {
           this.logger.warn(`Unknown sync job name: "${jobName}", using default user repositories sync handler`);
-          syncData = await processor.syncUserRepositories(job.data as SyncUserRepositoriesPayload);
+          syncData = await processor.syncUserRepositories(
+            job.data as SyncUserRepositoriesPayload,
+            {},
+            undefined,
+            async (progressUpdate) => {
+              if (typeof job.updateProgress === 'function') {
+                await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+              }
+            },
+          );
         }
       }
 
@@ -92,6 +119,10 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
         processedAt: new Date().toISOString(),
         details: {
           jobId: job.id,
+          syncId: (job.data as any)?.syncId,
+          userId: (job.data as any)?.userId,
+          scope: (job.data as any)?.scope,
+          totalCount: syncData?.totalCount,
         },
         data: syncData,
       };
