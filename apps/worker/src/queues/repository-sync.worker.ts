@@ -9,7 +9,7 @@ import {
   SyncRepositoryPullRequestsPayload,
   RepositorySyncJobPayload as DedicatedSyncPayload,
 } from '@devpulse/types';
-import { CorrelationContext } from '@devpulse/logger';
+import { CorrelationContext, redactCredentialString } from '@devpulse/logger';
 import { prisma } from '@devpulse/database';
 import { RedisService } from '../redis/redis.service';
 import { BaseWorker } from './base.worker';
@@ -185,16 +185,18 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
           data: syncData,
         };
       } catch (error: any) {
-        // Mark SyncRun as FAILED on error
+        // Mark SyncRun as FAILED on error with sanitized error message
         try {
           if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+            const rawErrorMsg = error?.message || 'Sync execution failed';
+            const safeErrorMessage = redactCredentialString(rawErrorMsg);
             await prisma.syncRun.updateMany({
               where: {
                 OR: [{ id: syncId }, { jobId: String(job.id) }],
               },
               data: {
                 status: 'FAILED',
-                errorMessage: error?.message || 'Sync execution failed',
+                errorMessage: safeErrorMessage,
                 lastProcessedAt: new Date(),
               },
             });

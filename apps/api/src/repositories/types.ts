@@ -112,6 +112,8 @@ export interface SyncHistoryItemDto {
   durationMs?: number;
   error?: string | null;
   result?: any;
+  githubAccountId?: string;
+  scope?: string;
 }
 
 

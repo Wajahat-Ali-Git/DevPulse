@@ -7,7 +7,7 @@ import { GitHubClient, GitHubNotFoundError, GitHubForbiddenError, GitHubReposito
 import { RepositoryStatus } from '@devpulse/database';
 import { Logger } from '@devpulse/logger';
 import { QueueName, JobName, SyncUserRepositoriesPayload } from '@devpulse/types';
-import { ResourceNotFoundException, AuthorizationException } from '../common/errors';
+import { ResourceNotFoundException, AuthorizationException, ConflictException } from '../common/errors';
 import {
   SyncRepositoryResult,
   SyncRepositoryOptions,
@@ -106,10 +106,49 @@ export class RepositorySyncService implements OnModuleDestroy {
       }
     }
 
-    // 3. Construct job payload and correlation tracking
+    // 3. Prevent duplicate active synchronization jobs for the same account and scope (unless forced)
+    const scope = dto.scope || 'all';
+    if (!dto.forced) {
+      // Check in-memory sync history for active job on same account/scope
+      const activeInMemory = this.syncHistory.find(
+        (h) =>
+          h.githubAccountId === gitHubAccount.id &&
+          (h.scope || 'all') === scope &&
+          (h.status === 'enqueued' || h.status === 'processing' || h.status === 'waiting' || h.status === 'active'),
+      );
+      if (activeInMemory) {
+        throw new ConflictException(
+          `A synchronization job is already active for this GitHub account and scope (${scope}). Wait for it to complete or provide forced=true to override.`,
+          { activeSyncId: activeInMemory.syncId, githubAccountId: gitHubAccount.id, scope },
+        );
+      }
+
+      // Check database SyncRun table for active jobs (QUEUED or PROCESSING)
+      if (prisma && prisma.syncRun && typeof prisma.syncRun.findFirst === 'function') {
+        try {
+          const activeDbRun = await prisma.syncRun.findFirst({
+            where: {
+              githubAccountId: gitHubAccount.id,
+              scope,
+              status: { in: ['QUEUED', 'PROCESSING'] },
+            },
+          });
+          if (activeDbRun) {
+            throw new ConflictException(
+              `A synchronization job is already active for this GitHub account and scope (${scope}). Wait for it to complete or provide forced=true to override.`,
+              { activeSyncId: activeDbRun.id, githubAccountId: gitHubAccount.id, scope },
+            );
+          }
+        } catch (err: any) {
+          if (err instanceof ConflictException) throw err;
+          this.logger.debug(`Could not check active db sync runs: ${err?.message}`);
+        }
+      }
+    }
+
+    // 4. Construct job payload and correlation tracking
     const correlationId = `sync_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const syncId = correlationId;
-    const scope = dto.scope || 'all';
     const payload: SyncUserRepositoriesPayload & { correlationId: string } = {
       userId,
       workspaceId: dto.workspaceId,
@@ -120,7 +159,7 @@ export class RepositorySyncService implements OnModuleDestroy {
       correlationId,
     };
 
-    // 4. Enqueue via dedicated RepositorySyncQueueService or fallback queue
+    // 5. Enqueue via dedicated RepositorySyncQueueService or fallback queue
     let job: any;
     if (this.syncQueueService) {
       job = await this.syncQueueService.addSyncUserRepositoriesJob(payload, {
@@ -182,6 +221,8 @@ export class RepositorySyncService implements OnModuleDestroy {
       workspaceId: dto.workspaceId,
       userId,
       enqueuedAt: initiatedAt,
+      githubAccountId: gitHubAccount.id,
+      scope,
     });
 
     return {

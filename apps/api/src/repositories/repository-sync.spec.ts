@@ -894,6 +894,69 @@ async function runTests() {
     console.log('  ✔ POST /sync/repositories, GET /sync/:syncId, and GET /sync/history work with multi-tenant isolation\n');
   }
 
+  // Test 21: Prevent duplicate active synchronization jobs for the same account and scope (409 Conflict)
+  {
+    console.log('Test 21: Prevent duplicate active synchronization jobs for the same account and scope');
+    const mockPrisma = new MockPrismaClient();
+    mockPrisma.workspaceMembers.push({ workspaceId: 'ws-1', userId: 'user-alice' });
+    mockPrisma.gitHubAccounts.push({
+      id: 'gh-alice',
+      userId: 'user-alice',
+      username: 'alice',
+      githubUserId: BigInt(12345),
+    });
+
+    const mockQueue: any = {
+      add: async () => ({ id: 'job-1' }),
+      getJob: async () => null,
+    };
+    const mockQueueService: any = {
+      getQueue: () => mockQueue as any,
+      addSyncUserRepositoriesJob: async (payload: any) => ({ id: 'job-1', data: payload }),
+    };
+    const service = new RepositorySyncService(
+      { client: mockPrisma as any } as any,
+      undefined,
+      mockQueueService,
+    );
+
+    // First sync enqueues cleanly
+    const firstSync = await service.enqueueRepositorySync('user-alice', {
+      workspaceId: 'ws-1',
+      githubAccountId: 'gh-alice',
+      scope: 'repositories',
+    });
+    assert.ok(firstSync.syncId);
+    assert.strictEqual(firstSync.status, 'enqueued');
+
+    // Second sync on same account and scope while first is active throws 409 Conflict
+    let duplicateError: any = null;
+    try {
+      await service.enqueueRepositorySync('user-alice', {
+        workspaceId: 'ws-1',
+        githubAccountId: 'gh-alice',
+        scope: 'repositories',
+      });
+    } catch (err) {
+      duplicateError = err;
+    }
+    assert.ok(duplicateError !== null, 'Should have thrown duplicate sync error');
+    assert.strictEqual(duplicateError.getStatus(), 409);
+    assert.strictEqual(duplicateError.code, 'CONFLICT');
+
+    // Forced sync bypasses duplicate check
+    const forcedSync = await service.enqueueRepositorySync('user-alice', {
+      workspaceId: 'ws-1',
+      githubAccountId: 'gh-alice',
+      scope: 'repositories',
+      forced: true,
+    });
+    assert.ok(forcedSync.syncId);
+    assert.strictEqual(forcedSync.status, 'enqueued');
+
+    console.log('  ✔ Duplicate active sync prevention and forced bypass verified\n');
+  }
+
   console.log('✅ ALL REPOSITORY SYNC, ISOLATION & TELEMETRY TESTS PASSED!\n');
 }
 
