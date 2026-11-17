@@ -250,29 +250,31 @@ model Commit {
 }
 
 model PullRequest {
-  id             String           @id @default(uuid())
-  repositoryId   String           @map("repository_id")
-  githubId       BigInt           @unique @map("github_id")
-  number         Int
-  title          String
-  body           String?
-  state          PullRequestState @default(OPEN)
-  authorUsername String           @map("author_username")
-  authorUserId   String?          @map("author_user_id")
-  sourceBranch   String           @map("source_branch")
-  targetBranch   String           @map("target_branch")
-  isDraft        Boolean          @default(false) @map("is_draft")
-  isMerged       Boolean          @default(false) @map("is_merged")
-  url            String?
-  additions      Int              @default(0)
-  deletions      Int              @default(0)
-  changedFiles   Int              @default(0) @map("changed_files")
-  mergedAt       DateTime?        @map("merged_at")
-  closedAt       DateTime?        @map("closed_at")
-  githubCreatedAt DateTime        @map("github_created_at")
-  githubUpdatedAt DateTime        @map("github_updated_at")
-  createdAt      DateTime         @default(now()) @map("created_at")
-  updatedAt      DateTime         @updatedAt @map("updated_at")
+  id              String           @id @default(uuid())
+  repositoryId    String           @map("repository_id")
+  githubId        BigInt           @unique @map("github_id")
+  number          Int
+  title           String
+  body            String?
+  state           PullRequestState @default(OPEN)
+  authorUsername  String           @map("author_username")
+  authorUserId    String?          @map("author_user_id")
+  authorGithubId  BigInt?          @map("author_github_id")
+  sourceBranch    String           @map("source_branch")
+  targetBranch    String           @map("target_branch")
+  isDraft         Boolean          @default(false) @map("is_draft")
+  isMerged        Boolean          @default(false) @map("is_merged")
+  url             String?
+  rawPayload      Json?            @map("raw_payload")
+  additions       Int              @default(0)
+  deletions       Int              @default(0)
+  changedFiles    Int              @default(0) @map("changed_files")
+  mergedAt        DateTime?        @map("merged_at")
+  closedAt        DateTime?        @map("closed_at")
+  githubCreatedAt DateTime         @map("github_created_at")
+  githubUpdatedAt DateTime         @map("github_updated_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
 
   repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
   authorUser User?      @relation("PullRequestAuthorUser", fields: [authorUserId], references: [id], onDelete: SetNull)
@@ -281,8 +283,11 @@ model PullRequest {
   @@unique([repositoryId, number])
   @@index([repositoryId])
   @@index([authorUserId])
+  @@index([authorGithubId])
   @@index([state])
+  @@index([isMerged])
   @@index([authorUsername])
+  @@index([githubUpdatedAt])
   @@index([createdAt])
   @@map("pull_requests")
 }

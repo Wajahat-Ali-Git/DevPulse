@@ -362,6 +362,14 @@ export interface SyncRepositoryPullRequestsPayload {
   workspaceId: string;
   fullName: string;
   state?: 'open' | 'closed' | 'all';
+  page?: number;
+  perPage?: number;
+  sort?: 'created' | 'updated' | 'popularity' | 'long-running';
+  direction?: 'asc' | 'desc';
+  syncId?: string;
+  userId?: string;
+  githubAccountId?: string;
+  correlationId?: string;
 }
 
 /**
