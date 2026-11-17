@@ -280,7 +280,138 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
             break;
           }
           case JobName.SYNC_REPOSITORY_PULL_REQUESTS: {
-            syncData = await processor.syncRepositoryPullRequests(job.data as SyncRepositoryPullRequestsPayload);
+            const prPayload = job.data as SyncRepositoryPullRequestsPayload;
+
+            syncData = await processor.syncRepositoryPullRequests(
+              prPayload,
+              {},
+              undefined,
+              async (progressUpdate) => {
+                if (typeof job.updateProgress === 'function') {
+                  await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+                }
+                // Update SyncRun with intermediate progress
+                try {
+                  if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+                    await prisma.syncRun.updateMany({
+                      where: {
+                        OR: [{ id: syncId }, { jobId: String(job.id) }],
+                      },
+                      data: {
+                        processedItems: progressUpdate.totalProcessed ?? 0,
+                        lastProcessedAt: new Date(),
+                      },
+                    });
+                  }
+                } catch {
+                  // progress tracking failure shouldn't abort job
+                }
+              },
+            );
+
+            // Persist retrieved pull requests avoiding duplicates and tracking lifecycle changes
+            if (syncData?.pullRequests && prisma && prisma.pullRequest && typeof prisma.pullRequest.upsert === 'function') {
+              let persistedPrCount = 0;
+              for (const ghPr of syncData.pullRequests) {
+                try {
+                  const githubId = BigInt(ghPr.id);
+                  const number = ghPr.number;
+                  const title = ghPr.title;
+                  const body = ghPr.body ?? null;
+                  const isMerged = Boolean(ghPr.merged || ghPr.merged_at);
+                  // Map state: MERGED if merged, otherwise OPEN or CLOSED
+                  const state = isMerged
+                    ? 'MERGED'
+                    : ghPr.state?.toUpperCase() === 'CLOSED'
+                    ? 'CLOSED'
+                    : 'OPEN';
+                  const authorUsername = ghPr.user?.login || 'unknown';
+                  const authorGithubId = ghPr.user?.id ? BigInt(ghPr.user.id) : null;
+                  const sourceBranch = ghPr.head?.ref || '';
+                  const targetBranch = ghPr.base?.ref || '';
+                  const isDraft = Boolean(ghPr.draft);
+                  const url = ghPr.html_url || null;
+                  const additions = ghPr.additions ?? 0;
+                  const deletions = ghPr.deletions ?? 0;
+                  const changedFiles = ghPr.changed_files ?? 0;
+                  const mergedAt = ghPr.merged_at ? new Date(ghPr.merged_at) : null;
+                  const closedAt = ghPr.closed_at ? new Date(ghPr.closed_at) : null;
+                  const githubCreatedAt = ghPr.created_at ? new Date(ghPr.created_at) : new Date();
+                  const githubUpdatedAt = ghPr.updated_at ? new Date(ghPr.updated_at) : new Date();
+
+                  // Resolve authorUserId if linked GitHubAccount exists
+                  let authorUserId: string | null = null;
+                  if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                    const linkedAccount = await prisma.gitHubAccount.findFirst({
+                      where: { githubUserId: authorGithubId },
+                      select: { userId: true },
+                    });
+                    if (linkedAccount) {
+                      authorUserId = linkedAccount.userId;
+                    }
+                  }
+
+                  await prisma.pullRequest.upsert({
+                    where: { githubId },
+                    update: {
+                      number,
+                      title,
+                      body,
+                      state: state as any,
+                      authorUsername,
+                      authorUserId,
+                      authorGithubId,
+                      sourceBranch,
+                      targetBranch,
+                      isDraft,
+                      isMerged,
+                      url,
+                      rawPayload: ghPr as any,
+                      additions,
+                      deletions,
+                      changedFiles,
+                      mergedAt,
+                      closedAt,
+                      githubCreatedAt,
+                      githubUpdatedAt,
+                    },
+                    create: {
+                      repositoryId: prPayload.repositoryId,
+                      githubId,
+                      number,
+                      title,
+                      body,
+                      state: state as any,
+                      authorUsername,
+                      authorUserId,
+                      authorGithubId,
+                      sourceBranch,
+                      targetBranch,
+                      isDraft,
+                      isMerged,
+                      url,
+                      rawPayload: ghPr as any,
+                      additions,
+                      deletions,
+                      changedFiles,
+                      mergedAt,
+                      closedAt,
+                      githubCreatedAt,
+                      githubUpdatedAt,
+                    },
+                  });
+                  persistedPrCount++;
+                } catch (prErr: any) {
+                  this.logger.warn(
+                    `Failed to upsert pull request #${ghPr.number} for repo ${prPayload.fullName}: ${prErr?.message}`,
+                  );
+                }
+              }
+              this.logger.info(
+                `Persisted/upserted ${persistedPrCount} pull requests for repository "${prPayload.fullName}"`,
+              );
+            }
+
             if (typeof job.updateProgress === 'function') {
               await job.updateProgress(100);
             }

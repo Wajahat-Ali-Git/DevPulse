@@ -403,6 +403,80 @@ async function runTests() {
     console.log('  ✔ Paginated commit retrieval and incremental checkpoints verified\n');
   }
 
+  // Test 9: syncRepositoryPullRequests retrieves open and closed pull requests with pagination
+  {
+    console.log('Test 9: syncRepositoryPullRequests retrieves open, closed, and merged pull requests with pagination');
+    const page1PRs = Array.from({ length: 100 }, (_, i) => ({
+      id: 6000 + i,
+      number: i + 1,
+      title: `PR ${i + 1}`,
+      body: `Description for PR ${i + 1}`,
+      state: i % 2 === 0 ? 'open' : 'closed',
+      merged_at: i % 4 === 0 ? '2024-01-02T00:00:00Z' : null,
+      draft: false,
+      user: { id: 2000 + i, login: `dev${i + 1}` },
+      head: { ref: `feature-${i + 1}` },
+      base: { ref: 'main' },
+      html_url: `https://github.com/org/repo-prs/pull/${i + 1}`,
+      created_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-02T00:00:00Z',
+    }));
+
+    const page2PRs = Array.from({ length: 25 }, (_, i) => ({
+      id: 7000 + i,
+      number: 100 + i + 1,
+      title: `PR ${100 + i + 1}`,
+      body: `Description for PR ${100 + i + 1}`,
+      state: 'closed',
+      merged_at: '2024-01-03T00:00:00Z',
+      draft: false,
+      user: { id: 3000 + i, login: `dev${100 + i + 1}` },
+      head: { ref: `fix-${i + 1}` },
+      base: { ref: 'main' },
+      html_url: `https://github.com/org/repo-prs/pull/${100 + i + 1}`,
+      created_at: '2024-01-02T00:00:00Z',
+      updated_at: '2024-01-03T00:00:00Z',
+    }));
+
+    const requestedPages: number[] = [];
+    const mockPrClient = {
+      pullRequests: {
+        list: async (owner: string, repo: string, params: any) => {
+          requestedPages.push(params.page);
+          if (params.page === 1) return page1PRs;
+          if (params.page === 2) return page2PRs;
+          return [];
+        },
+      },
+    } as any;
+
+    const reportedProgress: any[] = [];
+    const result = await processor.syncRepositoryPullRequests(
+      {
+        repositoryId: 'repo-prs-1',
+        workspaceId: 'ws-prs-1',
+        fullName: 'org/repo-prs',
+        state: 'all',
+      },
+      {},
+      mockPrClient,
+      async (prog) => {
+        reportedProgress.push({ ...prog });
+      },
+    );
+
+    assert.deepStrictEqual(requestedPages, [1, 2]);
+    assert.strictEqual(result.totalCount, 125);
+    assert.strictEqual(result.pagesProcessed, 2);
+    assert.strictEqual(reportedProgress.length, 2);
+    assert.strictEqual(reportedProgress[0].totalProcessed, 100);
+    assert.strictEqual(reportedProgress[1].totalProcessed, 125);
+    assert.strictEqual(result.pullRequests[0].state, 'open');
+    assert.strictEqual(result.pullRequests[1].state, 'closed');
+    assert.ok(result.pullRequests[0].merged_at !== null); // merged PR
+    console.log('  ✔ Pull request open, closed, and merged retrieval verified\n');
+  }
+
   console.log('✅ ALL GITHUB SYNC PROCESSOR TESTS PASSED!\n');
 }
 

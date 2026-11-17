@@ -55,11 +55,22 @@ export interface SyncCommitsResult {
   until?: string;
 }
 
+export interface SyncPullRequestsProgress {
+  page: number;
+  perPage: number;
+  totalProcessed: number;
+  hasMore: boolean;
+  percentage?: number;
+}
+
 export interface SyncPullRequestsResult {
   repositoryId?: string;
   fullName: string;
   pullRequests: GitHubPullRequest[];
   totalCount: number;
+  pagesProcessed?: number;
+  progressHistory?: SyncPullRequestsProgress[];
+  state?: string;
 }
 
 export interface RepositorySyncProcessorResult {
@@ -361,12 +372,14 @@ export class GitHubSyncProcessor {
   }
 
   /**
-   * Synchronizes pull requests for a repository using GitHubPullRequestsApi.
+   * Synchronizes pull requests for a repository using GitHubPullRequestsApi with pagination support,
+   * retrieving both open and closed pull requests, and sorting by updated timestamp for incremental sync.
    */
   async syncRepositoryPullRequests(
     payload: SyncRepositoryPullRequestsPayload,
     clientOptions: GitHubSyncProcessorOptions = {},
     customClient?: GitHubClient,
+    onProgress?: (progress: SyncPullRequestsProgress) => Promise<void> | void,
   ): Promise<SyncPullRequestsResult> {
     const client = customClient || this.createGitHubClient(clientOptions);
     const [owner, name] = payload.fullName.split('/');
@@ -375,29 +388,135 @@ export class GitHubSyncProcessor {
       throw new Error(`Invalid repository full name format: "${payload.fullName}". Expected "owner/repo".`);
     }
 
-    this.logger.info(`Invoking GitHub API to list pull requests for "${payload.fullName}" (state: ${payload.state || 'all'})`, {
-      repositoryId: payload.repositoryId,
-      fullName: payload.fullName,
-      state: payload.state,
-    });
+    const state = payload.state || 'all';
+    const sort = payload.sort || 'updated';
+    const direction = payload.direction || 'desc';
+    const perPage = payload.perPage || 100;
 
-    const pullRequests = await client.pullRequests.list(owner, name, {
-      state: (payload.state as any) || 'all',
-      sort: 'updated',
-      direction: 'desc',
-      per_page: 100,
-    });
+    this.logger.info(
+      `Invoking GitHub API to list pull requests for "${payload.fullName}" (state: ${state}, sort: ${sort}, dir: ${direction})`,
+      {
+        repositoryId: payload.repositoryId,
+        fullName: payload.fullName,
+        state,
+        sort,
+        direction,
+      },
+    );
 
-    this.logger.info(`Successfully fetched ${pullRequests.length} pull requests for "${payload.fullName}"`, {
-      repositoryId: payload.repositoryId,
-      count: pullRequests.length,
-    });
+    const allPullRequests: GitHubPullRequest[] = [];
+    const progressHistory: SyncPullRequestsProgress[] = [];
+
+    // If a specific page is requested, fetch only that single page
+    if (payload.page) {
+      const pullRequests = await client.pullRequests.list(owner, name, {
+        state: state as any,
+        sort: sort as any,
+        direction: direction as any,
+        page: payload.page,
+        per_page: perPage,
+      });
+
+      const count = pullRequests ? pullRequests.length : 0;
+      allPullRequests.push(...pullRequests);
+      const progressUpdate: SyncPullRequestsProgress = {
+        page: payload.page,
+        perPage,
+        totalProcessed: count,
+        hasMore: count === perPage,
+        percentage: 100,
+      };
+      progressHistory.push(progressUpdate);
+
+      if (onProgress) {
+        try {
+          await onProgress(progressUpdate);
+        } catch (err: any) {
+          this.logger.warn(`Failed to report pull request sync progress for page ${payload.page}: ${err?.message}`);
+        }
+      }
+
+      return {
+        repositoryId: payload.repositoryId,
+        fullName: payload.fullName,
+        pullRequests: allPullRequests,
+        totalCount: allPullRequests.length,
+        pagesProcessed: 1,
+        progressHistory,
+        state,
+      };
+    }
+
+    // Otherwise, iterate across pages
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const pagePRs = await client.pullRequests.list(owner, name, {
+        state: state as any,
+        sort: sort as any,
+        direction: direction as any,
+        page,
+        per_page: perPage,
+      });
+
+      const count = pagePRs ? pagePRs.length : 0;
+      if (count > 0) {
+        allPullRequests.push(...pagePRs);
+      }
+
+      hasMore = count === perPage;
+
+      const progressUpdate: SyncPullRequestsProgress = {
+        page,
+        perPage,
+        totalProcessed: allPullRequests.length,
+        hasMore,
+        percentage: hasMore ? Math.min(page * 20, 95) : 100,
+      };
+      progressHistory.push(progressUpdate);
+
+      if (onProgress) {
+        try {
+          await onProgress(progressUpdate);
+        } catch (err: any) {
+          this.logger.warn(`Failed to report pull request sync progress for page ${page}: ${err?.message}`);
+        }
+      }
+
+      this.logger.info(
+        `Retrieved page ${page} of pull requests (${count} items, total so far: ${allPullRequests.length}) for "${payload.fullName}"`,
+        {
+          repositoryId: payload.repositoryId,
+          fullName: payload.fullName,
+          page,
+          pageCount: count,
+          totalCount: allPullRequests.length,
+          hasMore,
+        },
+      );
+
+      page++;
+    }
+
+    this.logger.info(
+      `Completed pull request synchronization across ${page - 1} page(s), total: ${allPullRequests.length} PRs for "${payload.fullName}"`,
+      {
+        repositoryId: payload.repositoryId,
+        fullName: payload.fullName,
+        pagesProcessed: page - 1,
+        totalCount: allPullRequests.length,
+      },
+    );
 
     return {
       repositoryId: payload.repositoryId,
       fullName: payload.fullName,
-      pullRequests,
-      totalCount: pullRequests.length,
+      pullRequests: allPullRequests,
+      totalCount: allPullRequests.length,
+      pagesProcessed: page - 1,
+      progressHistory,
+      state,
     };
   }
 }
