@@ -347,6 +347,11 @@ export interface SyncRepositoryCommitsPayload {
   since?: string;
   until?: string;
   page?: number;
+  perPage?: number;
+  syncId?: string;
+  userId?: string;
+  githubAccountId?: string;
+  correlationId?: string;
 }
 
 /**

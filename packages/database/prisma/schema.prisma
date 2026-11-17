@@ -215,23 +215,26 @@ model Repository {
 }
 
 model Commit {
-  id             String    @id @default(uuid())
-  repositoryId   String    @map("repository_id")
-  sha            String
-  message        String
-  authorName     String    @map("author_name")
-  authorEmail    String    @map("author_email")
-  authorDate     DateTime  @map("author_date")
-  committerName  String?   @map("committer_name")
-  committerEmail String?   @map("committer_email")
-  committerDate  DateTime? @map("committer_date")
-  authorUserId   String?   @map("author_user_id")
-  url            String?
-  additions      Int       @default(0)
-  deletions      Int       @default(0)
-  totalChanges   Int       @default(0) @map("total_changes")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id              String    @id @default(uuid())
+  repositoryId    String    @map("repository_id")
+  sha             String
+  message         String
+  authorName      String    @map("author_name")
+  authorEmail     String    @map("author_email")
+  authorDate      DateTime  @map("author_date")
+  committerName   String?   @map("committer_name")
+  committerEmail  String?   @map("committer_email")
+  committerDate   DateTime? @map("committer_date")
+  authorUserId    String?   @map("author_user_id")
+  authorGithubId  BigInt?   @map("author_github_id")
+  url             String?
+  parentShas      String[]  @default([]) @map("parent_shas")
+  rawPayload      Json?     @map("raw_payload")
+  additions       Int       @default(0)
+  deletions       Int       @default(0)
+  totalChanges    Int       @default(0) @map("total_changes")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
 
   repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
   authorUser User?      @relation("CommitAuthorUser", fields: [authorUserId], references: [id], onDelete: SetNull)
@@ -239,6 +242,7 @@ model Commit {
   @@unique([repositoryId, sha])
   @@index([repositoryId])
   @@index([authorUserId])
+  @@index([authorGithubId])
   @@index([authorEmail])
   @@index([authorDate])
   @@index([sha])
