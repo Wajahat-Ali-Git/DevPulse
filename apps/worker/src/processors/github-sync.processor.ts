@@ -36,11 +36,23 @@ export interface SyncRepositoriesResult {
   progressHistory?: SyncRepositoriesProgress[];
 }
 
+export interface SyncCommitsProgress {
+  page: number;
+  perPage: number;
+  totalProcessed: number;
+  hasMore: boolean;
+  percentage?: number;
+}
+
 export interface SyncCommitsResult {
   repositoryId?: string;
   fullName: string;
   commits: GitHubCommit[];
   totalCount: number;
+  pagesProcessed?: number;
+  progressHistory?: SyncCommitsProgress[];
+  since?: string;
+  until?: string;
 }
 
 export interface SyncPullRequestsResult {
@@ -207,12 +219,14 @@ export class GitHubSyncProcessor {
   }
 
   /**
-   * Synchronizes commits for a repository using GitHubCommitsApi.
+   * Synchronizes commits for a repository using GitHubCommitsApi with pagination support
+   * and progress tracking. Supports incremental retrieval using the since parameter.
    */
   async syncRepositoryCommits(
     payload: SyncRepositoryCommitsPayload,
     clientOptions: GitHubSyncProcessorOptions = {},
     customClient?: GitHubClient,
+    onProgress?: (progress: SyncCommitsProgress) => Promise<void> | void,
   ): Promise<SyncCommitsResult> {
     const client = customClient || this.createGitHubClient(clientOptions);
     const [owner, name] = payload.fullName.split('/');
@@ -221,30 +235,128 @@ export class GitHubSyncProcessor {
       throw new Error(`Invalid repository full name format: "${payload.fullName}". Expected "owner/repo".`);
     }
 
-    this.logger.info(`Invoking GitHub API to list commits for "${payload.fullName}"`, {
+    this.logger.info(`Invoking GitHub API to list commits for "${payload.fullName}" with pagination`, {
       repositoryId: payload.repositoryId,
       fullName: payload.fullName,
       since: payload.since,
       until: payload.until,
     });
 
-    const commits = await client.commits.list(owner, name, {
-      since: payload.since,
-      until: payload.until,
-      page: payload.page,
-      per_page: 100,
-    });
+    const perPage = payload.perPage || 100;
+    const allCommits: GitHubCommit[] = [];
+    const progressHistory: SyncCommitsProgress[] = [];
 
-    this.logger.info(`Successfully fetched ${commits.length} commits for "${payload.fullName}"`, {
-      repositoryId: payload.repositoryId,
-      count: commits.length,
-    });
+    // If a specific page is requested, fetch only that single page
+    if (payload.page) {
+      const commits = await client.commits.list(owner, name, {
+        since: payload.since,
+        until: payload.until,
+        page: payload.page,
+        per_page: perPage,
+      });
+
+      const count = commits ? commits.length : 0;
+      allCommits.push(...commits);
+      const progressUpdate: SyncCommitsProgress = {
+        page: payload.page,
+        perPage,
+        totalProcessed: count,
+        hasMore: count === perPage,
+        percentage: 100,
+      };
+      progressHistory.push(progressUpdate);
+
+      if (onProgress) {
+        try {
+          await onProgress(progressUpdate);
+        } catch (err: any) {
+          this.logger.warn(`Failed to report commit sync progress for page ${payload.page}: ${err?.message}`);
+        }
+      }
+
+      return {
+        repositoryId: payload.repositoryId,
+        fullName: payload.fullName,
+        commits: allCommits,
+        totalCount: allCommits.length,
+        pagesProcessed: 1,
+        progressHistory,
+        since: payload.since,
+        until: payload.until,
+      };
+    }
+
+    // Otherwise, paginated retrieval across all available pages
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const pageCommits = await client.commits.list(owner, name, {
+        since: payload.since,
+        until: payload.until,
+        page,
+        per_page: perPage,
+      });
+
+      const count = pageCommits ? pageCommits.length : 0;
+      if (count > 0) {
+        allCommits.push(...pageCommits);
+      }
+
+      hasMore = count === perPage;
+
+      const progressUpdate: SyncCommitsProgress = {
+        page,
+        perPage,
+        totalProcessed: allCommits.length,
+        hasMore,
+        percentage: hasMore ? Math.min(page * 20, 95) : 100,
+      };
+      progressHistory.push(progressUpdate);
+
+      if (onProgress) {
+        try {
+          await onProgress(progressUpdate);
+        } catch (err: any) {
+          this.logger.warn(`Failed to report commit sync progress for page ${page}: ${err?.message}`);
+        }
+      }
+
+      this.logger.info(
+        `Retrieved page ${page} of commits (${count} items, total so far: ${allCommits.length}) for "${payload.fullName}"`,
+        {
+          repositoryId: payload.repositoryId,
+          fullName: payload.fullName,
+          page,
+          pageCount: count,
+          totalCount: allCommits.length,
+          hasMore,
+        },
+      );
+
+      page++;
+    }
+
+    this.logger.info(
+      `Completed commit synchronization across ${page - 1} page(s), total: ${allCommits.length} commits for "${payload.fullName}"`,
+      {
+        repositoryId: payload.repositoryId,
+        fullName: payload.fullName,
+        pagesProcessed: page - 1,
+        totalCount: allCommits.length,
+        since: payload.since,
+      },
+    );
 
     return {
       repositoryId: payload.repositoryId,
       fullName: payload.fullName,
-      commits,
-      totalCount: commits.length,
+      commits: allCommits,
+      totalCount: allCommits.length,
+      pagesProcessed: page - 1,
+      progressHistory,
+      since: payload.since,
+      until: payload.until,
     };
   }
 

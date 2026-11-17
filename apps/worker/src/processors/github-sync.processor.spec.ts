@@ -343,6 +343,66 @@ async function runTests() {
     console.log('  ✔ Pagination processes all pages and streams progress events accurately\n');
   }
 
+  // Test 8: syncRepositoryCommits paginated retrieval and progress reporting
+  {
+    console.log('Test 8: syncRepositoryCommits paginated retrieval across multiple pages');
+    const page1Commits = Array.from({ length: 100 }, (_, i) => ({
+      sha: `sha_p1_${i + 1}`,
+      commit: {
+        author: { name: `Author ${i + 1}`, email: `author${i + 1}@example.com`, date: '2024-01-01T00:00:00Z' },
+        message: `Commit ${i + 1}`,
+      },
+      author: { id: 1000 + i, login: `user${i + 1}` },
+      parents: i > 0 ? [{ sha: `sha_p1_${i}` }] : [],
+    }));
+
+    const page2Commits = Array.from({ length: 42 }, (_, i) => ({
+      sha: `sha_p2_${i + 1}`,
+      commit: {
+        author: { name: `Author ${100 + i + 1}`, email: `author${100 + i + 1}@example.com`, date: '2024-01-02T00:00:00Z' },
+        message: `Commit ${100 + i + 1}`,
+      },
+      author: null, // Test author without linked GitHub account
+      parents: [{ sha: `sha_p1_100` }],
+    }));
+
+    const requestedPages: number[] = [];
+    const mockCommitClient = {
+      commits: {
+        list: async (owner: string, repo: string, params: any) => {
+          requestedPages.push(params.page);
+          if (params.page === 1) return page1Commits;
+          if (params.page === 2) return page2Commits;
+          return [];
+        },
+      },
+    } as any;
+
+    const reportedProgress: any[] = [];
+    const result = await processor.syncRepositoryCommits(
+      {
+        repositoryId: 'repo-commits-1',
+        workspaceId: 'ws-commits-1',
+        fullName: 'org/repo-commits',
+        since: '2024-01-01T00:00:00Z',
+      },
+      {},
+      mockCommitClient,
+      async (prog) => {
+        reportedProgress.push({ ...prog });
+      },
+    );
+
+    assert.deepStrictEqual(requestedPages, [1, 2]);
+    assert.strictEqual(result.totalCount, 142);
+    assert.strictEqual(result.pagesProcessed, 2);
+    assert.strictEqual(reportedProgress.length, 2);
+    assert.strictEqual(reportedProgress[0].totalProcessed, 100);
+    assert.strictEqual(reportedProgress[1].totalProcessed, 142);
+    assert.strictEqual(result.commits[100].author, null, 'Commits authored without linked GitHub accounts handled');
+    console.log('  ✔ Paginated commit retrieval and incremental checkpoints verified\n');
+  }
+
   console.log('✅ ALL GITHUB SYNC PROCESSOR TESTS PASSED!\n');
 }
 

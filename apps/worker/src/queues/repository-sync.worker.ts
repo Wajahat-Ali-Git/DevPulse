@@ -123,7 +123,157 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
             break;
           }
           case JobName.SYNC_REPOSITORY_COMMITS: {
-            syncData = await processor.syncRepositoryCommits(job.data as SyncRepositoryCommitsPayload);
+            const commitPayload = job.data as SyncRepositoryCommitsPayload;
+            // Incremental retrieval checkpoint: if payload.since is not set, look up the latest commit date in DB
+            let effectiveSince = commitPayload.since;
+            if (!effectiveSince && prisma && prisma.commit && typeof prisma.commit.findFirst === 'function') {
+              try {
+                const latestCommit = await prisma.commit.findFirst({
+                  where: { repositoryId: commitPayload.repositoryId },
+                  orderBy: { authorDate: 'desc' },
+                  select: { authorDate: true },
+                });
+                if (latestCommit?.authorDate) {
+                  effectiveSince = latestCommit.authorDate.toISOString();
+                  this.logger.info(
+                    `Using incremental commit sync checkpoint since=${effectiveSince} for repo ${commitPayload.fullName}`,
+                  );
+                }
+              } catch (err: any) {
+                this.logger.debug(`Could not determine latest commit checkpoint: ${err?.message}`);
+              }
+            }
+
+            syncData = await processor.syncRepositoryCommits(
+              {
+                ...commitPayload,
+                since: effectiveSince,
+              },
+              {},
+              undefined,
+              async (progressUpdate) => {
+                if (typeof job.updateProgress === 'function') {
+                  await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+                }
+                // Update SyncRun with intermediate progress
+                try {
+                  if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+                    await prisma.syncRun.updateMany({
+                      where: {
+                        OR: [{ id: syncId }, { jobId: String(job.id) }],
+                      },
+                      data: {
+                        processedItems: progressUpdate.totalProcessed ?? 0,
+                        lastProcessedAt: new Date(),
+                      },
+                    });
+                  }
+                } catch {
+                  // progress tracking failure shouldn't abort job
+                }
+              },
+            );
+
+            // Persist retrieved commits avoiding duplicate commits and linking authors
+            if (syncData?.commits && prisma && prisma.commit && typeof prisma.commit.upsert === 'function') {
+              let persistedCount = 0;
+              for (const ghCommit of syncData.commits) {
+                try {
+                  const sha = ghCommit.sha;
+                  const message = ghCommit.commit?.message || '';
+                  const authorInfo = ghCommit.commit?.author;
+                  const committerInfo = ghCommit.commit?.committer;
+                  const authorName = authorInfo?.name || ghCommit.author?.login || 'Unknown Author';
+                  const authorEmail = authorInfo?.email || 'unknown@example.com';
+                  const authorDate = authorInfo?.date ? new Date(authorInfo.date) : new Date();
+                  const committerName = committerInfo?.name || ghCommit.committer?.login || null;
+                  const committerEmail = committerInfo?.email || null;
+                  const committerDate = committerInfo?.date ? new Date(committerInfo.date) : null;
+                  const url = ghCommit.html_url || ghCommit.url;
+                  const parentShas = Array.isArray(ghCommit.parents)
+                    ? ghCommit.parents.map((p: any) => p.sha).filter(Boolean)
+                    : [];
+                  const authorGithubId = ghCommit.author?.id ? BigInt(ghCommit.author.id) : null;
+
+                  // Resolve authorUserId if an existing GitHubAccount is linked
+                  let authorUserId: string | null = null;
+                  if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                    const linkedAccount = await prisma.gitHubAccount.findFirst({
+                      where: { githubUserId: authorGithubId },
+                      select: { userId: true },
+                    });
+                    if (linkedAccount) {
+                      authorUserId = linkedAccount.userId;
+                    }
+                  }
+
+                  // Fallback match by author email to User if no GitHubAccount link
+                  if (!authorUserId && authorEmail && prisma.user && typeof prisma.user.findFirst === 'function') {
+                    const matchedUser = await prisma.user.findFirst({
+                      where: { email: authorEmail },
+                      select: { id: true },
+                    });
+                    if (matchedUser) {
+                      authorUserId = matchedUser.id;
+                    }
+                  }
+
+                  await prisma.commit.upsert({
+                    where: {
+                      repositoryId_sha: {
+                        repositoryId: commitPayload.repositoryId,
+                        sha,
+                      },
+                    },
+                    update: {
+                      message,
+                      authorName,
+                      authorEmail,
+                      authorDate,
+                      committerName,
+                      committerEmail,
+                      committerDate,
+                      authorUserId,
+                      authorGithubId,
+                      url,
+                      parentShas,
+                      rawPayload: ghCommit as any,
+                      additions: ghCommit.stats?.additions ?? 0,
+                      deletions: ghCommit.stats?.deletions ?? 0,
+                      totalChanges: ghCommit.stats?.total ?? 0,
+                    },
+                    create: {
+                      repositoryId: commitPayload.repositoryId,
+                      sha,
+                      message,
+                      authorName,
+                      authorEmail,
+                      authorDate,
+                      committerName,
+                      committerEmail,
+                      committerDate,
+                      authorUserId,
+                      authorGithubId,
+                      url,
+                      parentShas,
+                      rawPayload: ghCommit as any,
+                      additions: ghCommit.stats?.additions ?? 0,
+                      deletions: ghCommit.stats?.deletions ?? 0,
+                      totalChanges: ghCommit.stats?.total ?? 0,
+                    },
+                  });
+                  persistedCount++;
+                } catch (commitErr: any) {
+                  this.logger.warn(
+                    `Failed to upsert commit ${ghCommit.sha} for repo ${commitPayload.fullName}: ${commitErr?.message}`,
+                  );
+                }
+              }
+              this.logger.info(
+                `Persisted/upserted ${persistedCount} commits for repository "${commitPayload.fullName}"`,
+              );
+            }
+
             if (typeof job.updateProgress === 'function') {
               await job.updateProgress(100);
             }
