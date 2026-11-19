@@ -204,6 +204,9 @@ export enum JobName {
   SYNC_SINGLE_REPOSITORY = 'sync-single-repository',
   SYNC_REPOSITORY_COMMITS = 'sync-repository-commits',
   SYNC_REPOSITORY_PULL_REQUESTS = 'sync-repository-pull-requests',
+  SYNC_REPOSITORY_ACTIVITY = 'sync-repository-activity',
+  SYNC_COMMITS = 'sync-commits',
+  SYNC_PULL_REQUESTS = 'sync-pull-requests',
 
   // Metrics Calculation
   CALCULATE_REPOSITORY_METRICS = 'calculate-repository-metrics',
@@ -265,6 +268,7 @@ export type SyncRunType =
   | 'SINGLE_REPOSITORY'
   | 'REPOSITORY_COMMITS'
   | 'REPOSITORY_PULL_REQUESTS'
+  | 'REPOSITORY_ACTIVITY'
   | 'FULL';
 
 /**
@@ -373,6 +377,24 @@ export interface SyncRepositoryPullRequestsPayload {
 }
 
 /**
+ * Payload for synchronizing repository activity (commits, pull requests, or both).
+ */
+export interface SyncRepositoryActivityPayload {
+  repositoryId: string;
+  workspaceId: string;
+  fullName: string;
+  syncCommits?: boolean;
+  syncPullRequests?: boolean;
+  since?: string;
+  until?: string;
+  prState?: 'open' | 'closed' | 'all';
+  syncId?: string;
+  userId?: string;
+  githubAccountId?: string;
+  correlationId?: string;
+}
+
+/**
  * Payload for calculating repository metrics.
  */
 export interface CalculateRepositoryMetricsPayload {
@@ -418,6 +440,9 @@ export interface JobPayloadMap {
   [JobName.SYNC_SINGLE_REPOSITORY]: SyncSingleRepositoryPayload;
   [JobName.SYNC_REPOSITORY_COMMITS]: SyncRepositoryCommitsPayload;
   [JobName.SYNC_REPOSITORY_PULL_REQUESTS]: SyncRepositoryPullRequestsPayload;
+  [JobName.SYNC_REPOSITORY_ACTIVITY]: SyncRepositoryActivityPayload;
+  [JobName.SYNC_COMMITS]: SyncRepositoryCommitsPayload;
+  [JobName.SYNC_PULL_REQUESTS]: SyncRepositoryPullRequestsPayload;
   [JobName.CALCULATE_REPOSITORY_METRICS]: CalculateRepositoryMetricsPayload;
   [JobName.CALCULATE_WORKSPACE_METRICS]: CalculateWorkspaceMetricsPayload;
   [JobName.SEND_EMAIL_NOTIFICATION]: SendEmailNotificationPayload;
