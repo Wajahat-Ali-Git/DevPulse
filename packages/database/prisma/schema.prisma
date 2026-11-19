@@ -201,6 +201,9 @@ model Repository {
   isFork        Boolean          @default(false) @map("is_fork")
   status        RepositoryStatus @default(ACTIVE)
   pushedAt      DateTime?        @map("pushed_at")
+  lastSyncedAt  DateTime?        @map("last_synced_at")
+  lastCommitSyncAt DateTime?     @map("last_commit_sync_at")
+  lastPrSyncAt     DateTime?     @map("last_pr_sync_at")
   createdAt     DateTime         @default(now()) @map("created_at")
   updatedAt     DateTime         @updatedAt @map("updated_at")
 
