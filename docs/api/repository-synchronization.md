@@ -178,6 +178,28 @@ Retrieves historical synchronization runs for workspaces the authenticated user 
 
 ---
 
+## Activity Synchronization Workflow (Commits & Pull Requests)
+
+In addition to repository list synchronization, DevPulse supports asynchronous activity synchronization for commits and pull requests.
+
+### Supported Activity Job Types
+1. **`sync-repository-commits` (`SYNC_COMMITS` / `SYNC_REPOSITORY_COMMITS`)**:
+   - Paginates through repository commits using GitHub's `/repos/{owner}/{repo}/commits` API.
+   - Respects incremental checkpoint `repository.lastCommitSyncAt` with an automatic 5-minute safety overlap window.
+   - Upserts into `commits` using unique constraint `(repository_id, sha)`.
+   - Links author to internal `users` table via `GitHubAccount.githubUserId` or `User.email` fallback.
+2. **`sync-repository-pull-requests` (`SYNC_PULL_REQUESTS` / `SYNC_REPOSITORY_PULL_REQUESTS`)**:
+   - Fetches pull requests with `state: all`, sorted by `updated` descending.
+   - Classifies PR status accurately into `OPEN`, `CLOSED`, or `MERGED` (using `pull_request.merged_at`).
+   - Tracks draft status, head/base branches, author, and GitHub updated timestamps.
+   - Upserts into `pull_requests` using unique `github_id` and natural key `(repository_id, number)`.
+   - Updates `repository.lastPrSyncAt`.
+3. **`sync-repository-activity` (`SYNC_REPOSITORY_ACTIVITY`)**:
+   - Sequentially synchronizes commits and pull requests for a given repository.
+   - Emits streaming progress updates across both stages.
+
+---
+
 ## Reliability & Resiliency Features
 
 1. **Retry Policy & Exponential Backoff**:

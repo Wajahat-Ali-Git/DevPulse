@@ -754,6 +754,44 @@ async function runTests() {
   assert.ok(failureHistory[1].error.includes('attempt 2'));
   console.log('  ✔ Retried job cleanly survives transient failures and recovers on subsequent attempt\n');
 
+  // Test 19: RepositorySyncWorker handles activity synchronization (commits + pull requests)
+  console.log('Test 19: RepositorySyncWorker processes SYNC_REPOSITORY_ACTIVITY with commits and PRs');
+  const activityWorker = new RepositorySyncWorker(redisService);
+  const activityProgress: number[] = [];
+  const activityJob = {
+    id: 'job_activity_1',
+    name: JobName.SYNC_REPOSITORY_ACTIVITY,
+    data: {
+      repositoryId: 'r-act-1',
+      workspaceId: 'w-act-1',
+      fullName: 'devpulse/activity-repo',
+      syncCommits: true,
+      syncPullRequests: true,
+    },
+    updateProgress: async (p: number) => {
+      activityProgress.push(p);
+    },
+  } as any;
+
+  (activityWorker as any).gitHubSyncProcessor = {
+    syncRepositoryCommits: async () => ({
+      commits: [],
+      totalCount: 10,
+    }),
+    syncRepositoryPullRequests: async () => ({
+      pullRequests: [],
+      totalCount: 5,
+    }),
+  };
+
+  const activityResult = await activityWorker.processJob(activityJob);
+  assert.strictEqual(activityResult.success, true);
+  assert.strictEqual(activityResult.jobName, JobName.SYNC_REPOSITORY_ACTIVITY);
+  assert.strictEqual(activityResult.data.commitsCount, 0);
+  assert.strictEqual(activityResult.data.prsCount, 0);
+  assert.strictEqual(activityProgress[activityProgress.length - 1], 100);
+  console.log('  ✔ SYNC_REPOSITORY_ACTIVITY processes commits and PRs with progress tracking\n');
+
   console.log('✅ ALL BULLMQ QUEUES, WORKERS, RETRY, TELEMETRY & SAFE SHUTDOWN TESTS PASSED!');
 }
 

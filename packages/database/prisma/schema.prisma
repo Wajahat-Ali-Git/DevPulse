@@ -68,6 +68,7 @@ enum SyncRunType {
   SINGLE_REPOSITORY
   REPOSITORY_COMMITS
   REPOSITORY_PULL_REQUESTS
+  REPOSITORY_ACTIVITY
   FULL
 }
 
@@ -200,6 +201,9 @@ model Repository {
   isFork        Boolean          @default(false) @map("is_fork")
   status        RepositoryStatus @default(ACTIVE)
   pushedAt      DateTime?        @map("pushed_at")
+  lastSyncedAt  DateTime?        @map("last_synced_at")
+  lastCommitSyncAt DateTime?     @map("last_commit_sync_at")
+  lastPrSyncAt     DateTime?     @map("last_pr_sync_at")
   createdAt     DateTime         @default(now()) @map("created_at")
   updatedAt     DateTime         @updatedAt @map("updated_at")
 
@@ -215,23 +219,26 @@ model Repository {
 }
 
 model Commit {
-  id             String    @id @default(uuid())
-  repositoryId   String    @map("repository_id")
-  sha            String
-  message        String
-  authorName     String    @map("author_name")
-  authorEmail    String    @map("author_email")
-  authorDate     DateTime  @map("author_date")
-  committerName  String?   @map("committer_name")
-  committerEmail String?   @map("committer_email")
-  committerDate  DateTime? @map("committer_date")
-  authorUserId   String?   @map("author_user_id")
-  url            String?
-  additions      Int       @default(0)
-  deletions      Int       @default(0)
-  totalChanges   Int       @default(0) @map("total_changes")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id              String    @id @default(uuid())
+  repositoryId    String    @map("repository_id")
+  sha             String
+  message         String
+  authorName      String    @map("author_name")
+  authorEmail     String    @map("author_email")
+  authorDate      DateTime  @map("author_date")
+  committerName   String?   @map("committer_name")
+  committerEmail  String?   @map("committer_email")
+  committerDate   DateTime? @map("committer_date")
+  authorUserId    String?   @map("author_user_id")
+  authorGithubId  BigInt?   @map("author_github_id")
+  url             String?
+  parentShas      String[]  @default([]) @map("parent_shas")
+  rawPayload      Json?     @map("raw_payload")
+  additions       Int       @default(0)
+  deletions       Int       @default(0)
+  totalChanges    Int       @default(0) @map("total_changes")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
 
   repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
   authorUser User?      @relation("CommitAuthorUser", fields: [authorUserId], references: [id], onDelete: SetNull)
@@ -239,6 +246,7 @@ model Commit {
   @@unique([repositoryId, sha])
   @@index([repositoryId])
   @@index([authorUserId])
+  @@index([authorGithubId])
   @@index([authorEmail])
   @@index([authorDate])
   @@index([sha])
@@ -246,29 +254,31 @@ model Commit {
 }
 
 model PullRequest {
-  id             String           @id @default(uuid())
-  repositoryId   String           @map("repository_id")
-  githubId       BigInt           @unique @map("github_id")
-  number         Int
-  title          String
-  body           String?
-  state          PullRequestState @default(OPEN)
-  authorUsername String           @map("author_username")
-  authorUserId   String?          @map("author_user_id")
-  sourceBranch   String           @map("source_branch")
-  targetBranch   String           @map("target_branch")
-  isDraft        Boolean          @default(false) @map("is_draft")
-  isMerged       Boolean          @default(false) @map("is_merged")
-  url            String?
-  additions      Int              @default(0)
-  deletions      Int              @default(0)
-  changedFiles   Int              @default(0) @map("changed_files")
-  mergedAt       DateTime?        @map("merged_at")
-  closedAt       DateTime?        @map("closed_at")
-  githubCreatedAt DateTime        @map("github_created_at")
-  githubUpdatedAt DateTime        @map("github_updated_at")
-  createdAt      DateTime         @default(now()) @map("created_at")
-  updatedAt      DateTime         @updatedAt @map("updated_at")
+  id              String           @id @default(uuid())
+  repositoryId    String           @map("repository_id")
+  githubId        BigInt           @unique @map("github_id")
+  number          Int
+  title           String
+  body            String?
+  state           PullRequestState @default(OPEN)
+  authorUsername  String           @map("author_username")
+  authorUserId    String?          @map("author_user_id")
+  authorGithubId  BigInt?          @map("author_github_id")
+  sourceBranch    String           @map("source_branch")
+  targetBranch    String           @map("target_branch")
+  isDraft         Boolean          @default(false) @map("is_draft")
+  isMerged        Boolean          @default(false) @map("is_merged")
+  url             String?
+  rawPayload      Json?            @map("raw_payload")
+  additions       Int              @default(0)
+  deletions       Int              @default(0)
+  changedFiles    Int              @default(0) @map("changed_files")
+  mergedAt        DateTime?        @map("merged_at")
+  closedAt        DateTime?        @map("closed_at")
+  githubCreatedAt DateTime         @map("github_created_at")
+  githubUpdatedAt DateTime         @map("github_updated_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
 
   repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
   authorUser User?      @relation("PullRequestAuthorUser", fields: [authorUserId], references: [id], onDelete: SetNull)
@@ -277,8 +287,11 @@ model PullRequest {
   @@unique([repositoryId, number])
   @@index([repositoryId])
   @@index([authorUserId])
+  @@index([authorGithubId])
   @@index([state])
+  @@index([isMerged])
   @@index([authorUsername])
+  @@index([githubUpdatedAt])
   @@index([createdAt])
   @@map("pull_requests")
 }
