@@ -7,6 +7,7 @@ import {
   SyncSingleRepositoryPayload,
   SyncRepositoryCommitsPayload,
   SyncRepositoryPullRequestsPayload,
+  SyncRepositoryActivityPayload,
   RepositorySyncJobPayload as DedicatedSyncPayload,
 } from '@devpulse/types';
 import { CorrelationContext, redactCredentialString } from '@devpulse/logger';
@@ -20,6 +21,7 @@ export type RepositorySyncJobPayload =
   | SyncSingleRepositoryPayload
   | SyncRepositoryCommitsPayload
   | SyncRepositoryPullRequestsPayload
+  | SyncRepositoryActivityPayload
   | DedicatedSyncPayload;
 
 export interface RepositorySyncJobResult {
@@ -122,6 +124,7 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
             }
             break;
           }
+          case JobName.SYNC_COMMITS:
           case JobName.SYNC_REPOSITORY_COMMITS: {
             const commitPayload = job.data as SyncRepositoryCommitsPayload;
             // Incremental retrieval checkpoint: if payload.since is not set, look up the latest commit date in DB
@@ -279,6 +282,7 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
             }
             break;
           }
+          case JobName.SYNC_PULL_REQUESTS:
           case JobName.SYNC_REPOSITORY_PULL_REQUESTS: {
             const prPayload = job.data as SyncRepositoryPullRequestsPayload;
 
@@ -411,6 +415,238 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
                 `Persisted/upserted ${persistedPrCount} pull requests for repository "${prPayload.fullName}"`,
               );
             }
+
+            if (typeof job.updateProgress === 'function') {
+              await job.updateProgress(100);
+            }
+            break;
+          }
+          case JobName.SYNC_REPOSITORY_ACTIVITY: {
+            const actPayload = job.data as SyncRepositoryActivityPayload;
+            const doCommits = actPayload.syncCommits !== false;
+            const doPRs = actPayload.syncPullRequests !== false;
+            let commitsCount = 0;
+            let prsCount = 0;
+
+            if (doCommits) {
+              const commitResult = await processor.syncRepositoryCommits(
+                {
+                  repositoryId: actPayload.repositoryId,
+                  workspaceId: actPayload.workspaceId,
+                  fullName: actPayload.fullName,
+                  since: actPayload.since,
+                  until: actPayload.until,
+                },
+                {},
+                undefined,
+                async (progress) => {
+                  if (typeof job.updateProgress === 'function') {
+                    await job.updateProgress(Math.floor((progress.percentage ?? 50) / 2));
+                  }
+                },
+              );
+
+              // Persist commits
+              if (commitResult?.commits && prisma && prisma.commit && typeof prisma.commit.upsert === 'function') {
+                for (const ghCommit of commitResult.commits) {
+                  try {
+                    const sha = ghCommit.sha;
+                    const message = ghCommit.commit?.message || '';
+                    const authorInfo = ghCommit.commit?.author;
+                    const committerInfo = ghCommit.commit?.committer;
+                    const authorName = authorInfo?.name || ghCommit.author?.login || 'Unknown Author';
+                    const authorEmail = authorInfo?.email || 'unknown@example.com';
+                    const authorDate = authorInfo?.date ? new Date(authorInfo.date) : new Date();
+                    const committerName = committerInfo?.name || ghCommit.committer?.login || null;
+                    const committerEmail = committerInfo?.email || null;
+                    const committerDate = committerInfo?.date ? new Date(committerInfo.date) : null;
+                    const url = ghCommit.html_url || ghCommit.url;
+                    const parentShas = Array.isArray(ghCommit.parents)
+                      ? ghCommit.parents.map((p: any) => p.sha).filter(Boolean)
+                      : [];
+                    const authorGithubId = ghCommit.author?.id ? BigInt(ghCommit.author.id) : null;
+
+                    let authorUserId: string | null = null;
+                    if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                      const linked = await prisma.gitHubAccount.findFirst({
+                        where: { githubUserId: authorGithubId },
+                        select: { userId: true },
+                      });
+                      if (linked) authorUserId = linked.userId;
+                    }
+                    if (!authorUserId && authorEmail && prisma.user && typeof prisma.user.findFirst === 'function') {
+                      const matched = await prisma.user.findFirst({
+                        where: { email: authorEmail },
+                        select: { id: true },
+                      });
+                      if (matched) authorUserId = matched.id;
+                    }
+
+                    await prisma.commit.upsert({
+                      where: { repositoryId_sha: { repositoryId: actPayload.repositoryId, sha } },
+                      update: {
+                        message,
+                        authorName,
+                        authorEmail,
+                        authorDate,
+                        committerName,
+                        committerEmail,
+                        committerDate,
+                        authorUserId,
+                        authorGithubId,
+                        url,
+                        parentShas,
+                        rawPayload: ghCommit as any,
+                        additions: ghCommit.stats?.additions ?? 0,
+                        deletions: ghCommit.stats?.deletions ?? 0,
+                        totalChanges: ghCommit.stats?.total ?? 0,
+                      },
+                      create: {
+                        repositoryId: actPayload.repositoryId,
+                        sha,
+                        message,
+                        authorName,
+                        authorEmail,
+                        authorDate,
+                        committerName,
+                        committerEmail,
+                        committerDate,
+                        authorUserId,
+                        authorGithubId,
+                        url,
+                        parentShas,
+                        rawPayload: ghCommit as any,
+                        additions: ghCommit.stats?.additions ?? 0,
+                        deletions: ghCommit.stats?.deletions ?? 0,
+                        totalChanges: ghCommit.stats?.total ?? 0,
+                      },
+                    });
+                    commitsCount++;
+                  } catch (err: any) {
+                    this.logger.warn(`Failed to upsert commit in activity sync: ${err?.message}`);
+                  }
+                }
+              }
+            }
+
+            if (doPRs) {
+              const prResult = await processor.syncRepositoryPullRequests(
+                {
+                  repositoryId: actPayload.repositoryId,
+                  workspaceId: actPayload.workspaceId,
+                  fullName: actPayload.fullName,
+                  state: actPayload.prState || 'all',
+                },
+                {},
+                undefined,
+                async (progress) => {
+                  if (typeof job.updateProgress === 'function') {
+                    await job.updateProgress(50 + Math.floor((progress.percentage ?? 50) / 2));
+                  }
+                },
+              );
+
+              // Persist pull requests
+              if (prResult?.pullRequests && prisma && prisma.pullRequest && typeof prisma.pullRequest.upsert === 'function') {
+                for (const ghPr of prResult.pullRequests) {
+                  try {
+                    const githubId = BigInt(ghPr.id);
+                    const number = ghPr.number;
+                    const title = ghPr.title;
+                    const body = ghPr.body ?? null;
+                    const isMerged = Boolean(ghPr.merged || ghPr.merged_at);
+                    const state = isMerged
+                      ? 'MERGED'
+                      : ghPr.state?.toUpperCase() === 'CLOSED'
+                      ? 'CLOSED'
+                      : 'OPEN';
+                    const authorUsername = ghPr.user?.login || 'unknown';
+                    const authorGithubId = ghPr.user?.id ? BigInt(ghPr.user.id) : null;
+                    const sourceBranch = ghPr.head?.ref || '';
+                    const targetBranch = ghPr.base?.ref || '';
+                    const isDraft = Boolean(ghPr.draft);
+                    const url = ghPr.html_url || null;
+                    const additions = ghPr.additions ?? 0;
+                    const deletions = ghPr.deletions ?? 0;
+                    const changedFiles = ghPr.changed_files ?? 0;
+                    const mergedAt = ghPr.merged_at ? new Date(ghPr.merged_at) : null;
+                    const closedAt = ghPr.closed_at ? new Date(ghPr.closed_at) : null;
+                    const githubCreatedAt = ghPr.created_at ? new Date(ghPr.created_at) : new Date();
+                    const githubUpdatedAt = ghPr.updated_at ? new Date(ghPr.updated_at) : new Date();
+
+                    let authorUserId: string | null = null;
+                    if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                      const linked = await prisma.gitHubAccount.findFirst({
+                        where: { githubUserId: authorGithubId },
+                        select: { userId: true },
+                      });
+                      if (linked) authorUserId = linked.userId;
+                    }
+
+                    await prisma.pullRequest.upsert({
+                      where: { githubId },
+                      update: {
+                        number,
+                        title,
+                        body,
+                        state: state as any,
+                        authorUsername,
+                        authorUserId,
+                        authorGithubId,
+                        sourceBranch,
+                        targetBranch,
+                        isDraft,
+                        isMerged,
+                        url,
+                        rawPayload: ghPr as any,
+                        additions,
+                        deletions,
+                        changedFiles,
+                        mergedAt,
+                        closedAt,
+                        githubCreatedAt,
+                        githubUpdatedAt,
+                      },
+                      create: {
+                        repositoryId: actPayload.repositoryId,
+                        githubId,
+                        number,
+                        title,
+                        body,
+                        state: state as any,
+                        authorUsername,
+                        authorUserId,
+                        authorGithubId,
+                        sourceBranch,
+                        targetBranch,
+                        isDraft,
+                        isMerged,
+                        url,
+                        rawPayload: ghPr as any,
+                        additions,
+                        deletions,
+                        changedFiles,
+                        mergedAt,
+                        closedAt,
+                        githubCreatedAt,
+                        githubUpdatedAt,
+                      },
+                    });
+                    prsCount++;
+                  } catch (err: any) {
+                    this.logger.warn(`Failed to upsert pull request in activity sync: ${err?.message}`);
+                  }
+                }
+              }
+            }
+
+            syncData = {
+              repositoryId: actPayload.repositoryId,
+              fullName: actPayload.fullName,
+              commitsCount,
+              prsCount,
+              totalCount: commitsCount + prsCount,
+            };
 
             if (typeof job.updateProgress === 'function') {
               await job.updateProgress(100);
