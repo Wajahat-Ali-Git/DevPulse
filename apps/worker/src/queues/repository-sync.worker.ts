@@ -127,23 +127,45 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
           case JobName.SYNC_COMMITS:
           case JobName.SYNC_REPOSITORY_COMMITS: {
             const commitPayload = job.data as SyncRepositoryCommitsPayload;
-            // Incremental retrieval checkpoint: if payload.since is not set, look up the latest commit date in DB
+            // Incremental retrieval checkpoint: check repository.lastCommitSyncAt or latest commit authorDate
             let effectiveSince = commitPayload.since;
-            if (!effectiveSince && prisma && prisma.commit && typeof prisma.commit.findFirst === 'function') {
+            if (!effectiveSince && prisma) {
               try {
-                const latestCommit = await prisma.commit.findFirst({
-                  where: { repositoryId: commitPayload.repositoryId },
-                  orderBy: { authorDate: 'desc' },
-                  select: { authorDate: true },
-                });
-                if (latestCommit?.authorDate) {
-                  effectiveSince = latestCommit.authorDate.toISOString();
+                // 1. Check repository-level checkpoint
+                if (prisma.repository && typeof prisma.repository.findUnique === 'function') {
+                  const repo = await prisma.repository.findUnique({
+                    where: { id: commitPayload.repositoryId },
+                    select: { lastCommitSyncAt: true },
+                  });
+                  if (repo?.lastCommitSyncAt) {
+                    // Overlapping time window: 5-minute safety buffer (300,000 ms) to avoid missing records
+                    const overlapBufferMs = 5 * 60 * 1000;
+                    effectiveSince = new Date(repo.lastCommitSyncAt.getTime() - overlapBufferMs).toISOString();
+                  }
+                }
+
+                // 2. Fallback to latest commit in DB if repository checkpoint was null
+                if (!effectiveSince && prisma.commit && typeof prisma.commit.findFirst === 'function') {
+                  const latestCommit = await prisma.commit.findFirst({
+                    where: { repositoryId: commitPayload.repositoryId },
+                    orderBy: { authorDate: 'desc' },
+                    select: { authorDate: true },
+                  });
+                  if (latestCommit?.authorDate) {
+                    const overlapBufferMs = 5 * 60 * 1000;
+                    effectiveSince = new Date(latestCommit.authorDate.getTime() - overlapBufferMs).toISOString();
+                  }
+                }
+
+                if (effectiveSince) {
                   this.logger.info(
-                    `Using incremental commit sync checkpoint since=${effectiveSince} for repo ${commitPayload.fullName}`,
+                    `Using incremental commit sync checkpoint with overlap since=${effectiveSince} for repo ${commitPayload.fullName}`,
                   );
+                } else {
+                  this.logger.info(`No previous commit checkpoint found. Performing full commit sync for ${commitPayload.fullName}`);
                 }
               } catch (err: any) {
-                this.logger.debug(`Could not determine latest commit checkpoint: ${err?.message}`);
+                this.logger.debug(`Could not determine commit checkpoint: ${err?.message}`);
               }
             }
 
@@ -275,6 +297,22 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
               this.logger.info(
                 `Persisted/upserted ${persistedCount} commits for repository "${commitPayload.fullName}"`,
               );
+
+              // Update repository checkpoint: lastCommitSyncAt and lastSyncedAt
+              try {
+                if (prisma.repository && typeof prisma.repository.update === 'function') {
+                  const now = new Date();
+                  await prisma.repository.update({
+                    where: { id: commitPayload.repositoryId },
+                    data: {
+                      lastCommitSyncAt: now,
+                      lastSyncedAt: now,
+                    },
+                  });
+                }
+              } catch (updateErr: any) {
+                this.logger.debug(`Could not update repository commit checkpoint: ${updateErr?.message}`);
+              }
             }
 
             if (typeof job.updateProgress === 'function') {
@@ -414,6 +452,22 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
               this.logger.info(
                 `Persisted/upserted ${persistedPrCount} pull requests for repository "${prPayload.fullName}"`,
               );
+
+              // Update repository checkpoint: lastPrSyncAt and lastSyncedAt
+              try {
+                if (prisma.repository && typeof prisma.repository.update === 'function') {
+                  const now = new Date();
+                  await prisma.repository.update({
+                    where: { id: prPayload.repositoryId },
+                    data: {
+                      lastPrSyncAt: now,
+                      lastSyncedAt: now,
+                    },
+                  });
+                }
+              } catch (updateErr: any) {
+                this.logger.debug(`Could not update repository PR checkpoint: ${updateErr?.message}`);
+              }
             }
 
             if (typeof job.updateProgress === 'function') {
