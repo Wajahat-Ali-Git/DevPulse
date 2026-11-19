@@ -343,6 +343,140 @@ async function runTests() {
     console.log('  ✔ Pagination processes all pages and streams progress events accurately\n');
   }
 
+  // Test 8: syncRepositoryCommits paginated retrieval and progress reporting
+  {
+    console.log('Test 8: syncRepositoryCommits paginated retrieval across multiple pages');
+    const page1Commits = Array.from({ length: 100 }, (_, i) => ({
+      sha: `sha_p1_${i + 1}`,
+      commit: {
+        author: { name: `Author ${i + 1}`, email: `author${i + 1}@example.com`, date: '2024-01-01T00:00:00Z' },
+        message: `Commit ${i + 1}`,
+      },
+      author: { id: 1000 + i, login: `user${i + 1}` },
+      parents: i > 0 ? [{ sha: `sha_p1_${i}` }] : [],
+    }));
+
+    const page2Commits = Array.from({ length: 42 }, (_, i) => ({
+      sha: `sha_p2_${i + 1}`,
+      commit: {
+        author: { name: `Author ${100 + i + 1}`, email: `author${100 + i + 1}@example.com`, date: '2024-01-02T00:00:00Z' },
+        message: `Commit ${100 + i + 1}`,
+      },
+      author: null, // Test author without linked GitHub account
+      parents: [{ sha: `sha_p1_100` }],
+    }));
+
+    const requestedPages: number[] = [];
+    const mockCommitClient = {
+      commits: {
+        list: async (owner: string, repo: string, params: any) => {
+          requestedPages.push(params.page);
+          if (params.page === 1) return page1Commits;
+          if (params.page === 2) return page2Commits;
+          return [];
+        },
+      },
+    } as any;
+
+    const reportedProgress: any[] = [];
+    const result = await processor.syncRepositoryCommits(
+      {
+        repositoryId: 'repo-commits-1',
+        workspaceId: 'ws-commits-1',
+        fullName: 'org/repo-commits',
+        since: '2024-01-01T00:00:00Z',
+      },
+      {},
+      mockCommitClient,
+      async (prog) => {
+        reportedProgress.push({ ...prog });
+      },
+    );
+
+    assert.deepStrictEqual(requestedPages, [1, 2]);
+    assert.strictEqual(result.totalCount, 142);
+    assert.strictEqual(result.pagesProcessed, 2);
+    assert.strictEqual(reportedProgress.length, 2);
+    assert.strictEqual(reportedProgress[0].totalProcessed, 100);
+    assert.strictEqual(reportedProgress[1].totalProcessed, 142);
+    assert.strictEqual(result.commits[100].author, null, 'Commits authored without linked GitHub accounts handled');
+    console.log('  ✔ Paginated commit retrieval and incremental checkpoints verified\n');
+  }
+
+  // Test 9: syncRepositoryPullRequests retrieves open and closed pull requests with pagination
+  {
+    console.log('Test 9: syncRepositoryPullRequests retrieves open, closed, and merged pull requests with pagination');
+    const page1PRs = Array.from({ length: 100 }, (_, i) => ({
+      id: 6000 + i,
+      number: i + 1,
+      title: `PR ${i + 1}`,
+      body: `Description for PR ${i + 1}`,
+      state: i % 2 === 0 ? 'open' : 'closed',
+      merged_at: i % 4 === 0 ? '2024-01-02T00:00:00Z' : null,
+      draft: false,
+      user: { id: 2000 + i, login: `dev${i + 1}` },
+      head: { ref: `feature-${i + 1}` },
+      base: { ref: 'main' },
+      html_url: `https://github.com/org/repo-prs/pull/${i + 1}`,
+      created_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-02T00:00:00Z',
+    }));
+
+    const page2PRs = Array.from({ length: 25 }, (_, i) => ({
+      id: 7000 + i,
+      number: 100 + i + 1,
+      title: `PR ${100 + i + 1}`,
+      body: `Description for PR ${100 + i + 1}`,
+      state: 'closed',
+      merged_at: '2024-01-03T00:00:00Z',
+      draft: false,
+      user: { id: 3000 + i, login: `dev${100 + i + 1}` },
+      head: { ref: `fix-${i + 1}` },
+      base: { ref: 'main' },
+      html_url: `https://github.com/org/repo-prs/pull/${100 + i + 1}`,
+      created_at: '2024-01-02T00:00:00Z',
+      updated_at: '2024-01-03T00:00:00Z',
+    }));
+
+    const requestedPages: number[] = [];
+    const mockPrClient = {
+      pullRequests: {
+        list: async (owner: string, repo: string, params: any) => {
+          requestedPages.push(params.page);
+          if (params.page === 1) return page1PRs;
+          if (params.page === 2) return page2PRs;
+          return [];
+        },
+      },
+    } as any;
+
+    const reportedProgress: any[] = [];
+    const result = await processor.syncRepositoryPullRequests(
+      {
+        repositoryId: 'repo-prs-1',
+        workspaceId: 'ws-prs-1',
+        fullName: 'org/repo-prs',
+        state: 'all',
+      },
+      {},
+      mockPrClient,
+      async (prog) => {
+        reportedProgress.push({ ...prog });
+      },
+    );
+
+    assert.deepStrictEqual(requestedPages, [1, 2]);
+    assert.strictEqual(result.totalCount, 125);
+    assert.strictEqual(result.pagesProcessed, 2);
+    assert.strictEqual(reportedProgress.length, 2);
+    assert.strictEqual(reportedProgress[0].totalProcessed, 100);
+    assert.strictEqual(reportedProgress[1].totalProcessed, 125);
+    assert.strictEqual(result.pullRequests[0].state, 'open');
+    assert.strictEqual(result.pullRequests[1].state, 'closed');
+    assert.ok(result.pullRequests[0].merged_at !== null); // merged PR
+    console.log('  ✔ Pull request open, closed, and merged retrieval verified\n');
+  }
+
   console.log('✅ ALL GITHUB SYNC PROCESSOR TESTS PASSED!\n');
 }
 

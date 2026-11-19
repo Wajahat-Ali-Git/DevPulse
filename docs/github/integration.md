@@ -178,9 +178,44 @@ GitHub enforces rate limits (e.g., 5,000 requests per hour for authenticated req
 
 ---
 
-## 7. Local Testing & Webhook Simulation
+## 7. Activity Synchronization Workflow (Commits & Pull Requests)
 
-### 7.1. Exposing Localhost to GitHub
+DevPulse implements robust background activity synchronization for repositories, tracking commits and pull requests with support for pagination, incremental checkpoints, author resolution, and duplicate prevention.
+
+### 7.1. Synchronization Jobs
+
+Activity synchronization is managed by `@devpulse/worker` through BullMQ jobs:
+- **`SYNC_COMMITS` (`sync-repository-commits`)**: Synchronizes commit history for a repository starting from the last known checkpoint or the beginning of time.
+- **`SYNC_PULL_REQUESTS` (`sync-repository-pull-requests`)**: Synchronizes pull requests, updating lifecycle states (`OPEN`, `CLOSED`, `MERGED`), draft statuses, and branches.
+- **`SYNC_REPOSITORY_ACTIVITY` (`sync-repository-activity`)**: An orchestration job that sequentially triggers both commit and pull request synchronization for a target repository and updates composite progress.
+
+### 7.2. Incremental Synchronization & Checkpoints
+
+To optimize API usage and avoid unnecessary rate-limit consumption:
+1. **Checkpoint Storage**:
+   - `Repository.lastCommitSyncAt`: Checkpoint for commits.
+   - `Repository.lastPrSyncAt`: Checkpoint for pull requests.
+   - `Repository.lastSyncedAt`: Overall synchronization timestamp.
+2. **Overlapping Safety Window**:
+   - Incremental commit requests use `since = lastCommitSyncAt - 5 minutes` (300,000 ms).
+   - This prevents dropped records caused by out-of-order commits, clock skew, or network latency during active pushes.
+3. **Full Synchronization Fallback**:
+   - When no checkpoint exists (initial repository sync), a full synchronization runs without a `since` filter.
+
+### 7.3. Deduplication & Upsertion Semantics
+
+- **Commits**: Uniquely identified by composite key `(repositoryId, sha)`. Re-syncing commits updates author resolution or raw payloads without inserting duplicates.
+- **Pull Requests**: Uniquely identified by `githubId` and natural key `(repositoryId, number)`. Reconciled by `updated_at` timestamps so status changes (e.g., opened -> merged) cleanly update existing database rows.
+- **Author Attribution**:
+  - Worker attempts to map `authorGithubId` via `GitHubAccount.githubUserId`.
+  - If unmapped, resolves by matching Git commit author email with `User.email`.
+  - Gracefully falls back to unlinked author representation (`authorUserId: null`) for commits authored by users without registered accounts.
+
+---
+
+## 8. Local Testing & Webhook Simulation
+
+### 8.1. Exposing Localhost to GitHub
 For local webhook testing without deploying to a public server, use a tunnel:
 ```bash
 # Using ngrok
@@ -190,7 +225,7 @@ ngrok http 3000
 smee --url https://smee.io/your-unique-channel --target http://localhost:3000/api/v1/webhooks/github
 ```
 
-### 7.2. Running Package Unit Tests
+### 8.2. Running Package Unit Tests
 Run the automated test suite for `@devpulse/github`:
 ```bash
 pnpm --filter @devpulse/github test

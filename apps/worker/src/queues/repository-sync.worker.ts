@@ -7,6 +7,7 @@ import {
   SyncSingleRepositoryPayload,
   SyncRepositoryCommitsPayload,
   SyncRepositoryPullRequestsPayload,
+  SyncRepositoryActivityPayload,
   RepositorySyncJobPayload as DedicatedSyncPayload,
 } from '@devpulse/types';
 import { CorrelationContext, redactCredentialString } from '@devpulse/logger';
@@ -20,6 +21,7 @@ export type RepositorySyncJobPayload =
   | SyncSingleRepositoryPayload
   | SyncRepositoryCommitsPayload
   | SyncRepositoryPullRequestsPayload
+  | SyncRepositoryActivityPayload
   | DedicatedSyncPayload;
 
 export interface RepositorySyncJobResult {
@@ -122,15 +124,584 @@ export class RepositorySyncWorker extends BaseWorker<RepositorySyncJobPayload, R
             }
             break;
           }
+          case JobName.SYNC_COMMITS:
           case JobName.SYNC_REPOSITORY_COMMITS: {
-            syncData = await processor.syncRepositoryCommits(job.data as SyncRepositoryCommitsPayload);
+            const commitPayload = job.data as SyncRepositoryCommitsPayload;
+            // Incremental retrieval checkpoint: check repository.lastCommitSyncAt or latest commit authorDate
+            let effectiveSince = commitPayload.since;
+            if (!effectiveSince && prisma) {
+              try {
+                // 1. Check repository-level checkpoint
+                if (prisma.repository && typeof prisma.repository.findUnique === 'function') {
+                  const repo = await prisma.repository.findUnique({
+                    where: { id: commitPayload.repositoryId },
+                    select: { lastCommitSyncAt: true },
+                  });
+                  if (repo?.lastCommitSyncAt) {
+                    // Overlapping time window: 5-minute safety buffer (300,000 ms) to avoid missing records
+                    const overlapBufferMs = 5 * 60 * 1000;
+                    effectiveSince = new Date(repo.lastCommitSyncAt.getTime() - overlapBufferMs).toISOString();
+                  }
+                }
+
+                // 2. Fallback to latest commit in DB if repository checkpoint was null
+                if (!effectiveSince && prisma.commit && typeof prisma.commit.findFirst === 'function') {
+                  const latestCommit = await prisma.commit.findFirst({
+                    where: { repositoryId: commitPayload.repositoryId },
+                    orderBy: { authorDate: 'desc' },
+                    select: { authorDate: true },
+                  });
+                  if (latestCommit?.authorDate) {
+                    const overlapBufferMs = 5 * 60 * 1000;
+                    effectiveSince = new Date(latestCommit.authorDate.getTime() - overlapBufferMs).toISOString();
+                  }
+                }
+
+                if (effectiveSince) {
+                  this.logger.info(
+                    `Using incremental commit sync checkpoint with overlap since=${effectiveSince} for repo ${commitPayload.fullName}`,
+                  );
+                } else {
+                  this.logger.info(`No previous commit checkpoint found. Performing full commit sync for ${commitPayload.fullName}`);
+                }
+              } catch (err: any) {
+                this.logger.debug(`Could not determine commit checkpoint: ${err?.message}`);
+              }
+            }
+
+            syncData = await processor.syncRepositoryCommits(
+              {
+                ...commitPayload,
+                since: effectiveSince,
+              },
+              {},
+              undefined,
+              async (progressUpdate) => {
+                if (typeof job.updateProgress === 'function') {
+                  await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+                }
+                // Update SyncRun with intermediate progress
+                try {
+                  if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+                    await prisma.syncRun.updateMany({
+                      where: {
+                        OR: [{ id: syncId }, { jobId: String(job.id) }],
+                      },
+                      data: {
+                        processedItems: progressUpdate.totalProcessed ?? 0,
+                        lastProcessedAt: new Date(),
+                      },
+                    });
+                  }
+                } catch {
+                  // progress tracking failure shouldn't abort job
+                }
+              },
+            );
+
+            // Persist retrieved commits avoiding duplicate commits and linking authors
+            if (syncData?.commits && prisma && prisma.commit && typeof prisma.commit.upsert === 'function') {
+              let persistedCount = 0;
+              for (const ghCommit of syncData.commits) {
+                try {
+                  const sha = ghCommit.sha;
+                  const message = ghCommit.commit?.message || '';
+                  const authorInfo = ghCommit.commit?.author;
+                  const committerInfo = ghCommit.commit?.committer;
+                  const authorName = authorInfo?.name || ghCommit.author?.login || 'Unknown Author';
+                  const authorEmail = authorInfo?.email || 'unknown@example.com';
+                  const authorDate = authorInfo?.date ? new Date(authorInfo.date) : new Date();
+                  const committerName = committerInfo?.name || ghCommit.committer?.login || null;
+                  const committerEmail = committerInfo?.email || null;
+                  const committerDate = committerInfo?.date ? new Date(committerInfo.date) : null;
+                  const url = ghCommit.html_url || ghCommit.url;
+                  const parentShas = Array.isArray(ghCommit.parents)
+                    ? ghCommit.parents.map((p: any) => p.sha).filter(Boolean)
+                    : [];
+                  const authorGithubId = ghCommit.author?.id ? BigInt(ghCommit.author.id) : null;
+
+                  // Resolve authorUserId if an existing GitHubAccount is linked
+                  let authorUserId: string | null = null;
+                  if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                    const linkedAccount = await prisma.gitHubAccount.findFirst({
+                      where: { githubUserId: authorGithubId },
+                      select: { userId: true },
+                    });
+                    if (linkedAccount) {
+                      authorUserId = linkedAccount.userId;
+                    }
+                  }
+
+                  // Fallback match by author email to User if no GitHubAccount link
+                  if (!authorUserId && authorEmail && prisma.user && typeof prisma.user.findFirst === 'function') {
+                    const matchedUser = await prisma.user.findFirst({
+                      where: { email: authorEmail },
+                      select: { id: true },
+                    });
+                    if (matchedUser) {
+                      authorUserId = matchedUser.id;
+                    }
+                  }
+
+                  await prisma.commit.upsert({
+                    where: {
+                      repositoryId_sha: {
+                        repositoryId: commitPayload.repositoryId,
+                        sha,
+                      },
+                    },
+                    update: {
+                      message,
+                      authorName,
+                      authorEmail,
+                      authorDate,
+                      committerName,
+                      committerEmail,
+                      committerDate,
+                      authorUserId,
+                      authorGithubId,
+                      url,
+                      parentShas,
+                      rawPayload: ghCommit as any,
+                      additions: ghCommit.stats?.additions ?? 0,
+                      deletions: ghCommit.stats?.deletions ?? 0,
+                      totalChanges: ghCommit.stats?.total ?? 0,
+                    },
+                    create: {
+                      repositoryId: commitPayload.repositoryId,
+                      sha,
+                      message,
+                      authorName,
+                      authorEmail,
+                      authorDate,
+                      committerName,
+                      committerEmail,
+                      committerDate,
+                      authorUserId,
+                      authorGithubId,
+                      url,
+                      parentShas,
+                      rawPayload: ghCommit as any,
+                      additions: ghCommit.stats?.additions ?? 0,
+                      deletions: ghCommit.stats?.deletions ?? 0,
+                      totalChanges: ghCommit.stats?.total ?? 0,
+                    },
+                  });
+                  persistedCount++;
+                } catch (commitErr: any) {
+                  this.logger.warn(
+                    `Failed to upsert commit ${ghCommit.sha} for repo ${commitPayload.fullName}: ${commitErr?.message}`,
+                  );
+                }
+              }
+              this.logger.info(
+                `Persisted/upserted ${persistedCount} commits for repository "${commitPayload.fullName}"`,
+              );
+
+              // Update repository checkpoint: lastCommitSyncAt and lastSyncedAt
+              try {
+                if (prisma.repository && typeof prisma.repository.update === 'function') {
+                  const now = new Date();
+                  await prisma.repository.update({
+                    where: { id: commitPayload.repositoryId },
+                    data: {
+                      lastCommitSyncAt: now,
+                      lastSyncedAt: now,
+                    },
+                  });
+                }
+              } catch (updateErr: any) {
+                this.logger.debug(`Could not update repository commit checkpoint: ${updateErr?.message}`);
+              }
+            }
+
             if (typeof job.updateProgress === 'function') {
               await job.updateProgress(100);
             }
             break;
           }
+          case JobName.SYNC_PULL_REQUESTS:
           case JobName.SYNC_REPOSITORY_PULL_REQUESTS: {
-            syncData = await processor.syncRepositoryPullRequests(job.data as SyncRepositoryPullRequestsPayload);
+            const prPayload = job.data as SyncRepositoryPullRequestsPayload;
+
+            syncData = await processor.syncRepositoryPullRequests(
+              prPayload,
+              {},
+              undefined,
+              async (progressUpdate) => {
+                if (typeof job.updateProgress === 'function') {
+                  await job.updateProgress(progressUpdate.percentage ?? progressUpdate.totalProcessed);
+                }
+                // Update SyncRun with intermediate progress
+                try {
+                  if (prisma && prisma.syncRun && typeof prisma.syncRun.updateMany === 'function') {
+                    await prisma.syncRun.updateMany({
+                      where: {
+                        OR: [{ id: syncId }, { jobId: String(job.id) }],
+                      },
+                      data: {
+                        processedItems: progressUpdate.totalProcessed ?? 0,
+                        lastProcessedAt: new Date(),
+                      },
+                    });
+                  }
+                } catch {
+                  // progress tracking failure shouldn't abort job
+                }
+              },
+            );
+
+            // Persist retrieved pull requests avoiding duplicates and tracking lifecycle changes
+            if (syncData?.pullRequests && prisma && prisma.pullRequest && typeof prisma.pullRequest.upsert === 'function') {
+              let persistedPrCount = 0;
+              for (const ghPr of syncData.pullRequests) {
+                try {
+                  const githubId = BigInt(ghPr.id);
+                  const number = ghPr.number;
+                  const title = ghPr.title;
+                  const body = ghPr.body ?? null;
+                  const isMerged = Boolean(ghPr.merged || ghPr.merged_at);
+                  // Map state: MERGED if merged, otherwise OPEN or CLOSED
+                  const state = isMerged
+                    ? 'MERGED'
+                    : ghPr.state?.toUpperCase() === 'CLOSED'
+                    ? 'CLOSED'
+                    : 'OPEN';
+                  const authorUsername = ghPr.user?.login || 'unknown';
+                  const authorGithubId = ghPr.user?.id ? BigInt(ghPr.user.id) : null;
+                  const sourceBranch = ghPr.head?.ref || '';
+                  const targetBranch = ghPr.base?.ref || '';
+                  const isDraft = Boolean(ghPr.draft);
+                  const url = ghPr.html_url || null;
+                  const additions = ghPr.additions ?? 0;
+                  const deletions = ghPr.deletions ?? 0;
+                  const changedFiles = ghPr.changed_files ?? 0;
+                  const mergedAt = ghPr.merged_at ? new Date(ghPr.merged_at) : null;
+                  const closedAt = ghPr.closed_at ? new Date(ghPr.closed_at) : null;
+                  const githubCreatedAt = ghPr.created_at ? new Date(ghPr.created_at) : new Date();
+                  const githubUpdatedAt = ghPr.updated_at ? new Date(ghPr.updated_at) : new Date();
+
+                  // Resolve authorUserId if linked GitHubAccount exists
+                  let authorUserId: string | null = null;
+                  if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                    const linkedAccount = await prisma.gitHubAccount.findFirst({
+                      where: { githubUserId: authorGithubId },
+                      select: { userId: true },
+                    });
+                    if (linkedAccount) {
+                      authorUserId = linkedAccount.userId;
+                    }
+                  }
+
+                  await prisma.pullRequest.upsert({
+                    where: { githubId },
+                    update: {
+                      number,
+                      title,
+                      body,
+                      state: state as any,
+                      authorUsername,
+                      authorUserId,
+                      authorGithubId,
+                      sourceBranch,
+                      targetBranch,
+                      isDraft,
+                      isMerged,
+                      url,
+                      rawPayload: ghPr as any,
+                      additions,
+                      deletions,
+                      changedFiles,
+                      mergedAt,
+                      closedAt,
+                      githubCreatedAt,
+                      githubUpdatedAt,
+                    },
+                    create: {
+                      repositoryId: prPayload.repositoryId,
+                      githubId,
+                      number,
+                      title,
+                      body,
+                      state: state as any,
+                      authorUsername,
+                      authorUserId,
+                      authorGithubId,
+                      sourceBranch,
+                      targetBranch,
+                      isDraft,
+                      isMerged,
+                      url,
+                      rawPayload: ghPr as any,
+                      additions,
+                      deletions,
+                      changedFiles,
+                      mergedAt,
+                      closedAt,
+                      githubCreatedAt,
+                      githubUpdatedAt,
+                    },
+                  });
+                  persistedPrCount++;
+                } catch (prErr: any) {
+                  this.logger.warn(
+                    `Failed to upsert pull request #${ghPr.number} for repo ${prPayload.fullName}: ${prErr?.message}`,
+                  );
+                }
+              }
+              this.logger.info(
+                `Persisted/upserted ${persistedPrCount} pull requests for repository "${prPayload.fullName}"`,
+              );
+
+              // Update repository checkpoint: lastPrSyncAt and lastSyncedAt
+              try {
+                if (prisma.repository && typeof prisma.repository.update === 'function') {
+                  const now = new Date();
+                  await prisma.repository.update({
+                    where: { id: prPayload.repositoryId },
+                    data: {
+                      lastPrSyncAt: now,
+                      lastSyncedAt: now,
+                    },
+                  });
+                }
+              } catch (updateErr: any) {
+                this.logger.debug(`Could not update repository PR checkpoint: ${updateErr?.message}`);
+              }
+            }
+
+            if (typeof job.updateProgress === 'function') {
+              await job.updateProgress(100);
+            }
+            break;
+          }
+          case JobName.SYNC_REPOSITORY_ACTIVITY: {
+            const actPayload = job.data as SyncRepositoryActivityPayload;
+            const doCommits = actPayload.syncCommits !== false;
+            const doPRs = actPayload.syncPullRequests !== false;
+            let commitsCount = 0;
+            let prsCount = 0;
+
+            if (doCommits) {
+              const commitResult = await processor.syncRepositoryCommits(
+                {
+                  repositoryId: actPayload.repositoryId,
+                  workspaceId: actPayload.workspaceId,
+                  fullName: actPayload.fullName,
+                  since: actPayload.since,
+                  until: actPayload.until,
+                },
+                {},
+                undefined,
+                async (progress) => {
+                  if (typeof job.updateProgress === 'function') {
+                    await job.updateProgress(Math.floor((progress.percentage ?? 50) / 2));
+                  }
+                },
+              );
+
+              // Persist commits
+              if (commitResult?.commits && prisma && prisma.commit && typeof prisma.commit.upsert === 'function') {
+                for (const ghCommit of commitResult.commits) {
+                  try {
+                    const sha = ghCommit.sha;
+                    const message = ghCommit.commit?.message || '';
+                    const authorInfo = ghCommit.commit?.author;
+                    const committerInfo = ghCommit.commit?.committer;
+                    const authorName = authorInfo?.name || ghCommit.author?.login || 'Unknown Author';
+                    const authorEmail = authorInfo?.email || 'unknown@example.com';
+                    const authorDate = authorInfo?.date ? new Date(authorInfo.date) : new Date();
+                    const committerName = committerInfo?.name || ghCommit.committer?.login || null;
+                    const committerEmail = committerInfo?.email || null;
+                    const committerDate = committerInfo?.date ? new Date(committerInfo.date) : null;
+                    const url = ghCommit.html_url || ghCommit.url;
+                    const parentShas = Array.isArray(ghCommit.parents)
+                      ? ghCommit.parents.map((p: any) => p.sha).filter(Boolean)
+                      : [];
+                    const authorGithubId = ghCommit.author?.id ? BigInt(ghCommit.author.id) : null;
+
+                    let authorUserId: string | null = null;
+                    if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                      const linked = await prisma.gitHubAccount.findFirst({
+                        where: { githubUserId: authorGithubId },
+                        select: { userId: true },
+                      });
+                      if (linked) authorUserId = linked.userId;
+                    }
+                    if (!authorUserId && authorEmail && prisma.user && typeof prisma.user.findFirst === 'function') {
+                      const matched = await prisma.user.findFirst({
+                        where: { email: authorEmail },
+                        select: { id: true },
+                      });
+                      if (matched) authorUserId = matched.id;
+                    }
+
+                    await prisma.commit.upsert({
+                      where: { repositoryId_sha: { repositoryId: actPayload.repositoryId, sha } },
+                      update: {
+                        message,
+                        authorName,
+                        authorEmail,
+                        authorDate,
+                        committerName,
+                        committerEmail,
+                        committerDate,
+                        authorUserId,
+                        authorGithubId,
+                        url,
+                        parentShas,
+                        rawPayload: ghCommit as any,
+                        additions: ghCommit.stats?.additions ?? 0,
+                        deletions: ghCommit.stats?.deletions ?? 0,
+                        totalChanges: ghCommit.stats?.total ?? 0,
+                      },
+                      create: {
+                        repositoryId: actPayload.repositoryId,
+                        sha,
+                        message,
+                        authorName,
+                        authorEmail,
+                        authorDate,
+                        committerName,
+                        committerEmail,
+                        committerDate,
+                        authorUserId,
+                        authorGithubId,
+                        url,
+                        parentShas,
+                        rawPayload: ghCommit as any,
+                        additions: ghCommit.stats?.additions ?? 0,
+                        deletions: ghCommit.stats?.deletions ?? 0,
+                        totalChanges: ghCommit.stats?.total ?? 0,
+                      },
+                    });
+                    commitsCount++;
+                  } catch (err: any) {
+                    this.logger.warn(`Failed to upsert commit in activity sync: ${err?.message}`);
+                  }
+                }
+              }
+            }
+
+            if (doPRs) {
+              const prResult = await processor.syncRepositoryPullRequests(
+                {
+                  repositoryId: actPayload.repositoryId,
+                  workspaceId: actPayload.workspaceId,
+                  fullName: actPayload.fullName,
+                  state: actPayload.prState || 'all',
+                },
+                {},
+                undefined,
+                async (progress) => {
+                  if (typeof job.updateProgress === 'function') {
+                    await job.updateProgress(50 + Math.floor((progress.percentage ?? 50) / 2));
+                  }
+                },
+              );
+
+              // Persist pull requests
+              if (prResult?.pullRequests && prisma && prisma.pullRequest && typeof prisma.pullRequest.upsert === 'function') {
+                for (const ghPr of prResult.pullRequests) {
+                  try {
+                    const githubId = BigInt(ghPr.id);
+                    const number = ghPr.number;
+                    const title = ghPr.title;
+                    const body = ghPr.body ?? null;
+                    const isMerged = Boolean(ghPr.merged || ghPr.merged_at);
+                    const state = isMerged
+                      ? 'MERGED'
+                      : ghPr.state?.toUpperCase() === 'CLOSED'
+                      ? 'CLOSED'
+                      : 'OPEN';
+                    const authorUsername = ghPr.user?.login || 'unknown';
+                    const authorGithubId = ghPr.user?.id ? BigInt(ghPr.user.id) : null;
+                    const sourceBranch = ghPr.head?.ref || '';
+                    const targetBranch = ghPr.base?.ref || '';
+                    const isDraft = Boolean(ghPr.draft);
+                    const url = ghPr.html_url || null;
+                    const additions = ghPr.additions ?? 0;
+                    const deletions = ghPr.deletions ?? 0;
+                    const changedFiles = ghPr.changed_files ?? 0;
+                    const mergedAt = ghPr.merged_at ? new Date(ghPr.merged_at) : null;
+                    const closedAt = ghPr.closed_at ? new Date(ghPr.closed_at) : null;
+                    const githubCreatedAt = ghPr.created_at ? new Date(ghPr.created_at) : new Date();
+                    const githubUpdatedAt = ghPr.updated_at ? new Date(ghPr.updated_at) : new Date();
+
+                    let authorUserId: string | null = null;
+                    if (authorGithubId && prisma.gitHubAccount && typeof prisma.gitHubAccount.findFirst === 'function') {
+                      const linked = await prisma.gitHubAccount.findFirst({
+                        where: { githubUserId: authorGithubId },
+                        select: { userId: true },
+                      });
+                      if (linked) authorUserId = linked.userId;
+                    }
+
+                    await prisma.pullRequest.upsert({
+                      where: { githubId },
+                      update: {
+                        number,
+                        title,
+                        body,
+                        state: state as any,
+                        authorUsername,
+                        authorUserId,
+                        authorGithubId,
+                        sourceBranch,
+                        targetBranch,
+                        isDraft,
+                        isMerged,
+                        url,
+                        rawPayload: ghPr as any,
+                        additions,
+                        deletions,
+                        changedFiles,
+                        mergedAt,
+                        closedAt,
+                        githubCreatedAt,
+                        githubUpdatedAt,
+                      },
+                      create: {
+                        repositoryId: actPayload.repositoryId,
+                        githubId,
+                        number,
+                        title,
+                        body,
+                        state: state as any,
+                        authorUsername,
+                        authorUserId,
+                        authorGithubId,
+                        sourceBranch,
+                        targetBranch,
+                        isDraft,
+                        isMerged,
+                        url,
+                        rawPayload: ghPr as any,
+                        additions,
+                        deletions,
+                        changedFiles,
+                        mergedAt,
+                        closedAt,
+                        githubCreatedAt,
+                        githubUpdatedAt,
+                      },
+                    });
+                    prsCount++;
+                  } catch (err: any) {
+                    this.logger.warn(`Failed to upsert pull request in activity sync: ${err?.message}`);
+                  }
+                }
+              }
+            }
+
+            syncData = {
+              repositoryId: actPayload.repositoryId,
+              fullName: actPayload.fullName,
+              commitsCount,
+              prsCount,
+              totalCount: commitsCount + prsCount,
+            };
+
             if (typeof job.updateProgress === 'function') {
               await job.updateProgress(100);
             }

@@ -258,9 +258,15 @@ Git commits synced from tracked repositories.
 - **Indexes**:
   - `commits_repository_id_idx` (`repository_id`)
   - `commits_author_user_id_idx` (`author_user_id`)
+  - `commits_author_github_id_idx` (`author_github_id`)
   - `commits_author_email_idx` (`author_email`)
   - `commits_author_date_idx` (`author_date`)
   - `commits_sha_idx` (`sha`)
+- **Key Fields**:
+  - `sha`: Unique commit SHA string per repository.
+  - `author_github_id`: BigInt GitHub user ID (where available) enabling author attribution even without local user accounts.
+  - `parent_shas`: String array of parent commit SHAs.
+  - `raw_payload`: Full GitHub commit payload (JSONB) for analytics and historical replay.
 
 ### 5. `pull_requests`
 Pull requests synced from tracked repositories.
@@ -273,9 +279,17 @@ Pull requests synced from tracked repositories.
 - **Indexes**:
   - `pull_requests_repository_id_idx` (`repository_id`)
   - `pull_requests_author_user_id_idx` (`author_user_id`)
+  - `pull_requests_author_github_id_idx` (`author_github_id`)
   - `pull_requests_state_idx` (`state`)
+  - `pull_requests_is_merged_idx` (`is_merged`)
   - `pull_requests_author_username_idx` (`author_username`)
+  - `pull_requests_github_updated_at_idx` (`github_updated_at`)
   - `pull_requests_created_at_idx` (`created_at`)
+- **Key Fields**:
+  - `github_id`: Stable global external identifier from GitHub.
+  - `[repository_id, number]`: Scoped natural unique identifier per repository.
+  - `is_merged`: Boolean flag distinguishing merged pull requests from merely closed pull requests.
+  - `raw_payload`: Full GitHub PR payload (JSONB) for analytics and downstream processing.
 
 ### 6. `reviews`
 Code reviews submitted on pull requests.
