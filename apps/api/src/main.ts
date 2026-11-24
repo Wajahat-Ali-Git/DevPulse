@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { json, urlencoded } from 'express';
 import { config, validateConfig } from '@devpulse/config';
 import { NestLoggerAdapter, Logger, createCorrelationMiddleware } from '@devpulse/logger';
 import { AppModule } from './app.module';
@@ -14,7 +15,20 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule, {
     logger: nestLogger,
+    rawBody: true,
   });
+
+  // Configure JSON and URL-encoded parsers with explicit 1MB payload limits and rawBody retention
+  app.use(
+    json({
+      limit: '1mb',
+      verify: (req: any, _res, buf) => {
+        // Retain original raw body buffer for HMAC signature verification
+        req.rawBody = buf;
+      },
+    }),
+  );
+  app.use(urlencoded({ extended: true, limit: '1mb' }));
 
   // Attach Correlation and Request Tracing Middleware
   app.use(createCorrelationMiddleware({ serviceName: 'api' }));
