@@ -568,6 +568,55 @@ async function runWebhookTests() {
     console.log('  ✔ Delivery ID, event type, repo ID & full name, sender ID, action, and received timestamp extracted and normalized');
   }
 
+  // Test 11: Malformed JSON payload handling
+  console.log('\nTest 11: Malformed JSON rejection');
+  {
+    const malformedRaw = '{"action":"opened", invalid_json';
+    const sig = GitHubWebhooks.sign(malformedRaw, secret);
+    const req = {
+      body: undefined, // Body parser failed or empty
+      rawBody: Buffer.from(malformedRaw, 'utf8'),
+      headers: {},
+    } as unknown as Request;
+
+    await assert.rejects(
+      async () => {
+        await controller.handleGitHubWebhook(
+          req,
+          sig,
+          'pull_request',
+          'del-malformed-json-1',
+          'application/json',
+        );
+      },
+      (err: any) => {
+        assert(err instanceof BadRequestException);
+        assert.strictEqual(err.message, 'Webhook payload must be a valid JSON object');
+        return true;
+      },
+    );
+    console.log('  ✔ Malformed JSON payload cleanly rejected with 400 Bad Request');
+  }
+
+  // Test 12: Centralized config security and frontend isolation
+  console.log('\nTest 12: Centralized config isolation (GITHUB_WEBHOOK_SECRET is private)');
+  {
+    // config.private.github.webhookSecret exists
+    assert.ok(config.private.github.webhookSecret, 'Private config must contain webhookSecret');
+    // config.public.github must NOT contain webhookSecret
+    assert.strictEqual(
+      (config.public.github as any).webhookSecret,
+      undefined,
+      'Public config must NEVER expose webhookSecret',
+    );
+    assert.strictEqual(
+      (config.public as any).githubWebhookSecret,
+      undefined,
+      'Public config must NEVER expose githubWebhookSecret',
+    );
+    console.log('  ✔ GITHUB_WEBHOOK_SECRET is strictly confined to server-side private configuration');
+  }
+
   console.log('\n✅ ALL GITHUB WEBHOOK ENDPOINT TESTS PASSED SUCCESSFULLY!\n');
 }
 
