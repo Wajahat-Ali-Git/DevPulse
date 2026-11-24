@@ -45,6 +45,7 @@ async function runWebhookTests() {
     assert.strictEqual(response.received, true);
     assert.strictEqual(response.event, 'ping');
     assert.strictEqual(response.delivery, 'delivery-uuid-1');
+    assert.strictEqual(response.status, 'accepted');
     console.log('  ✔ Webhook successfully accepted with 202 and correct payload');
   }
 
@@ -238,6 +239,9 @@ async function runWebhookTests() {
       caughtError = err;
     }
 
+    // Restore original secret
+    (config.github as any).webhookSecret = secret;
+
     assert(caughtError instanceof UnauthorizedException);
     const errorString = JSON.stringify(caughtError);
     assert(!errorString.includes(secretValue), 'Secret leaked in error object!');
@@ -271,6 +275,234 @@ async function runWebhookTests() {
       },
     );
     console.log('  ✔ Tampered payload strictly caught by HMAC signature mismatch');
+  }
+
+  // Test 7: Supported events validation (push, pull_request, pull_request_review, repository)
+  console.log('\nTest 7: Supported events field validation');
+  {
+    const repoObj = { id: 101, name: 'core', full_name: 'devpulse/core' };
+    const senderObj = { id: 202, login: 'octocat' };
+
+    // 7.1 Push event
+    const pushPayload = {
+      ref: 'refs/heads/main',
+      commits: [{ id: 'c1', message: 'feat: add feature' }],
+      repository: repoObj,
+      sender: senderObj,
+    };
+    const pushRaw = JSON.stringify(pushPayload);
+    const pushSig = GitHubWebhooks.sign(pushRaw, secret);
+    const pushReq = createMockReq(pushPayload, pushRaw);
+    const pushRes = await controller.handleGitHubWebhook(
+      pushReq,
+      pushSig,
+      'push',
+      'del-push-1',
+      'application/json',
+    );
+    assert.strictEqual(pushRes.event, 'push');
+    assert.strictEqual(pushRes.status, 'accepted');
+
+    // Missing ref in push
+    const invalidPushPayload = { commits: [], repository: repoObj };
+    const invalidPushRaw = JSON.stringify(invalidPushPayload);
+    const invalidPushSig = GitHubWebhooks.sign(invalidPushRaw, secret);
+    const invalidPushReq = createMockReq(invalidPushPayload, invalidPushRaw);
+    await assert.rejects(
+      async () => {
+        await controller.handleGitHubWebhook(
+          invalidPushReq,
+          invalidPushSig,
+          'push',
+          'del-push-2',
+          'application/json',
+        );
+      },
+      (err: any) => {
+        assert(err instanceof BadRequestException);
+        assert(err.message.includes('ref'));
+        return true;
+      },
+    );
+
+    // 7.2 Pull request event
+    const prPayload = {
+      action: 'opened',
+      pull_request: { id: 303, number: 42, title: 'New PR' },
+      repository: repoObj,
+      sender: senderObj,
+    };
+    const prRaw = JSON.stringify(prPayload);
+    const prSig = GitHubWebhooks.sign(prRaw, secret);
+    const prReq = createMockReq(prPayload, prRaw);
+    const prRes = await controller.handleGitHubWebhook(
+      prReq,
+      prSig,
+      'pull_request',
+      'del-pr-1',
+      'application/json',
+    );
+    assert.strictEqual(prRes.event, 'pull_request');
+    assert.strictEqual(prRes.status, 'accepted');
+
+    // Missing pull_request object
+    const invalidPrPayload = { action: 'opened', repository: repoObj };
+    const invalidPrRaw = JSON.stringify(invalidPrPayload);
+    const invalidPrSig = GitHubWebhooks.sign(invalidPrRaw, secret);
+    const invalidPrReq = createMockReq(invalidPrPayload, invalidPrRaw);
+    await assert.rejects(
+      async () => {
+        await controller.handleGitHubWebhook(
+          invalidPrReq,
+          invalidPrSig,
+          'pull_request',
+          'del-pr-2',
+          'application/json',
+        );
+      },
+      (err: any) => {
+        assert(err instanceof BadRequestException);
+        return true;
+      },
+    );
+
+    // 7.3 Pull request review event
+    const reviewPayload = {
+      action: 'submitted',
+      pull_request: { id: 303, number: 42 },
+      review: { id: 404, state: 'approved' },
+      repository: repoObj,
+      sender: senderObj,
+    };
+    const reviewRaw = JSON.stringify(reviewPayload);
+    const reviewSig = GitHubWebhooks.sign(reviewRaw, secret);
+    const reviewReq = createMockReq(reviewPayload, reviewRaw);
+    const reviewRes = await controller.handleGitHubWebhook(
+      reviewReq,
+      reviewSig,
+      'pull_request_review',
+      'del-rev-1',
+      'application/json',
+    );
+    assert.strictEqual(reviewRes.event, 'pull_request_review');
+    assert.strictEqual(reviewRes.status, 'accepted');
+
+    // 7.4 Repository lifecycle event
+    const repoPayload = {
+      action: 'created',
+      repository: repoObj,
+      sender: senderObj,
+    };
+    const repoRaw = JSON.stringify(repoPayload);
+    const repoSig = GitHubWebhooks.sign(repoRaw, secret);
+    const repoReq = createMockReq(repoPayload, repoRaw);
+    const repoRes = await controller.handleGitHubWebhook(
+      repoReq,
+      repoSig,
+      'repository',
+      'del-repo-1',
+      'application/json',
+    );
+    assert.strictEqual(repoRes.event, 'repository');
+    assert.strictEqual(repoRes.status, 'accepted');
+
+    console.log('  ✔ Push, pull_request, pull_request_review, and repository event payloads validated');
+  }
+
+  // Test 8: Safely ignore unsupported event types without throwing 500
+  console.log('\nTest 8: Safely ignore unsupported event types');
+  {
+    const payload = { action: 'created', check_run: { id: 999 } };
+    const rawPayload = JSON.stringify(payload);
+    const sig = GitHubWebhooks.sign(rawPayload, secret);
+    const req = createMockReq(payload, rawPayload);
+
+    const res = await controller.handleGitHubWebhook(
+      req,
+      sig,
+      'check_run',
+      'del-unsupported-1',
+      'application/json',
+    );
+
+    assert.strictEqual(res.received, true);
+    assert.strictEqual(res.event, 'check_run');
+    assert.strictEqual(res.status, 'ignored');
+    console.log('  ✔ Unsupported event types (e.g. check_run) safely ignored with status: ignored');
+  }
+
+  // Test 9: Repository and actor account validation using mocked database
+  console.log('\nTest 9: Repository and actor account ownership check against connected accounts');
+  {
+    const mockDb: any = {
+      client: {
+        repository: {
+          findFirst: async ({ where }: any) => {
+            if (where.githubId === BigInt(101)) {
+              return { id: 'db-repo-101', workspaceId: 'ws-101' };
+            }
+            return null;
+          },
+        },
+        gitHubAccount: {
+          findFirst: async ({ where }: any) => {
+            if (where.githubUserId === BigInt(202)) {
+              return { id: 'db-gh-acc-202', userId: 'user-202' };
+            }
+            return null;
+          },
+        },
+      },
+    };
+
+    const serviceWithDb = new WebhooksService(mockDb);
+    const controllerWithDb = new WebhooksController(serviceWithDb);
+
+    // Tracked repository & connected user
+    const payload1 = {
+      ref: 'refs/heads/main',
+      commits: [{ id: 'c1' }],
+      repository: { id: 101, name: 'core', full_name: 'devpulse/core' },
+      sender: { id: 202, login: 'octocat' },
+    };
+    const raw1 = JSON.stringify(payload1);
+    const sig1 = GitHubWebhooks.sign(raw1, secret);
+    const req1 = createMockReq(payload1, raw1);
+
+    const res1 = await controllerWithDb.handleGitHubWebhook(
+      req1,
+      sig1,
+      'push',
+      'del-acc-1',
+      'application/json',
+    );
+    assert.strictEqual(res1.status, 'accepted');
+    assert.strictEqual(res1.details?.isTracked, true);
+    assert.strictEqual(res1.details?.hasConnectedAccount, true);
+
+    // Untracked repository & unknown user
+    const payload2 = {
+      ref: 'refs/heads/main',
+      commits: [{ id: 'c2' }],
+      repository: { id: 999999, name: 'external', full_name: 'stranger/external' },
+      sender: { id: 888888, login: 'stranger' },
+    };
+    const raw2 = JSON.stringify(payload2);
+    const sig2 = GitHubWebhooks.sign(raw2, secret);
+    const req2 = createMockReq(payload2, raw2);
+
+    const res2 = await controllerWithDb.handleGitHubWebhook(
+      req2,
+      sig2,
+      'push',
+      'del-acc-2',
+      'application/json',
+    );
+    assert.strictEqual(res2.status, 'accepted');
+    assert.strictEqual(res2.details?.isTracked, false);
+    assert.strictEqual(res2.details?.hasConnectedAccount, false);
+
+    console.log('  ✔ Repository and actor successfully validated against connected accounts without trusting unverified IDs');
   }
 
   console.log('\n✅ ALL GITHUB WEBHOOK ENDPOINT TESTS PASSED SUCCESSFULLY!\n');
