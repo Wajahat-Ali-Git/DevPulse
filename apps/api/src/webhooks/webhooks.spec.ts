@@ -505,6 +505,69 @@ async function runWebhookTests() {
     console.log('  ✔ Repository and actor successfully validated against connected accounts without trusting unverified IDs');
   }
 
+  // Test 10: Metadata extraction and normalization
+  console.log('\nTest 10: Normalized webhook metadata extraction');
+  {
+    const beforeTime = new Date();
+    const payload = {
+      action: 'opened',
+      pull_request: { id: 7001, number: 10, title: 'Extract metadata' },
+      repository: { id: 8001, name: 'devpulse', full_name: 'devpulse/devpulse' },
+      sender: { id: 9001, login: 'developer-jane' },
+    };
+    const rawPayload = JSON.stringify(payload);
+    const sig = GitHubWebhooks.sign(rawPayload, secret);
+    const req = createMockReq(payload, rawPayload);
+
+    const res = await controller.handleGitHubWebhook(
+      req,
+      sig,
+      'pull_request',
+      'delivery-meta-12345',
+      'application/json',
+    );
+
+    assert.strictEqual(res.received, true);
+    assert.strictEqual(res.event, 'pull_request');
+    assert.strictEqual(res.delivery, 'delivery-meta-12345');
+    assert.strictEqual(res.status, 'accepted');
+
+    // Verify normalized metadata fields
+    const meta = res.metadata;
+    assert.ok(meta, 'Metadata must be defined');
+    assert.strictEqual(meta.deliveryId, 'delivery-meta-12345');
+    assert.strictEqual(meta.eventType, 'pull_request');
+    assert.strictEqual(meta.repositoryGitHubId, BigInt(8001));
+    assert.strictEqual(meta.repositoryFullName, 'devpulse/devpulse');
+    assert.strictEqual(meta.senderGitHubId, BigInt(9001));
+    assert.strictEqual(meta.action, 'opened');
+    assert(meta.receivedAt instanceof Date, 'receivedAt must be a Date instance');
+    assert(meta.receivedAt.getTime() >= beforeTime.getTime());
+
+    // Verify ping metadata extraction without repository or sender
+    const pingPayload = { zen: 'Favor focus over features.' };
+    const pingRaw = JSON.stringify(pingPayload);
+    const pingSig = GitHubWebhooks.sign(pingRaw, secret);
+    const pingReq = createMockReq(pingPayload, pingRaw);
+
+    const pingRes = await controller.handleGitHubWebhook(
+      pingReq,
+      pingSig,
+      'ping',
+      'delivery-ping-999',
+      'application/json',
+    );
+    assert.ok(pingRes.metadata, 'Ping metadata must be defined');
+    assert.strictEqual(pingRes.metadata.deliveryId, 'delivery-ping-999');
+    assert.strictEqual(pingRes.metadata.eventType, 'ping');
+    assert.strictEqual(pingRes.metadata.repositoryGitHubId, undefined);
+    assert.strictEqual(pingRes.metadata.repositoryFullName, undefined);
+    assert.strictEqual(pingRes.metadata.senderGitHubId, undefined);
+    assert.strictEqual(pingRes.metadata.action, undefined);
+
+    console.log('  ✔ Delivery ID, event type, repo ID & full name, sender ID, action, and received timestamp extracted and normalized');
+  }
+
   console.log('\n✅ ALL GITHUB WEBHOOK ENDPOINT TESTS PASSED SUCCESSFULLY!\n');
 }
 

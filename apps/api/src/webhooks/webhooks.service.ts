@@ -7,6 +7,7 @@ import {
   isSupportedGitHubEvent,
   validateEventPayload,
   ValidatedWebhookEvent,
+  WebhookMetadata,
 } from './event-validator';
 
 export interface ProcessGitHubWebhookOptions {
@@ -22,6 +23,7 @@ export interface WebhookResponse {
   event: string;
   delivery: string;
   status: 'accepted' | 'ignored';
+  metadata?: WebhookMetadata;
   details?: Record<string, any>;
 }
 
@@ -99,6 +101,7 @@ export class WebhooksService {
         event: 'ping',
         delivery: deliveryId,
         status: 'accepted',
+        metadata: validatedEvent.metadata,
         details: { zen: parsedJson.zen, hookId: parsedJson.hook_id },
       };
     }
@@ -144,6 +147,7 @@ export class WebhooksService {
       event,
       delivery: deliveryId,
       status: 'accepted',
+      metadata: validatedEvent.metadata,
       details: {
         repository: repository?.fullName,
         action: validatedEvent.action,

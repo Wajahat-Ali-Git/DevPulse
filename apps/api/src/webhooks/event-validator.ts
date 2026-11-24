@@ -27,6 +27,16 @@ export interface ValidatedActorInfo {
   username: string;
 }
 
+export interface WebhookMetadata {
+  deliveryId: string;
+  eventType: string;
+  repositoryGitHubId?: bigint;
+  repositoryFullName?: string;
+  senderGitHubId?: bigint;
+  action?: string;
+  receivedAt: Date;
+}
+
 export interface ValidatedWebhookEvent {
   event: SupportedGitHubEvent;
   deliveryId: string;
@@ -34,7 +44,30 @@ export interface ValidatedWebhookEvent {
   action?: string;
   repository?: ValidatedRepositoryInfo;
   actor?: ValidatedActorInfo;
+  metadata: WebhookMetadata;
   payload: Record<string, any>;
+}
+
+/**
+ * Extracts and normalizes relevant webhook metadata.
+ */
+export function extractWebhookMetadata(options: {
+  deliveryId: string;
+  eventType: string;
+  repository?: ValidatedRepositoryInfo;
+  actor?: ValidatedActorInfo;
+  action?: string;
+  receivedAt?: Date;
+}): WebhookMetadata {
+  return {
+    deliveryId: options.deliveryId,
+    eventType: options.eventType,
+    repositoryGitHubId: options.repository?.githubRepoId,
+    repositoryFullName: options.repository?.fullName,
+    senderGitHubId: options.actor?.githubUserId,
+    action: options.action,
+    receivedAt: options.receivedAt ?? new Date(),
+  };
 }
 
 /**
@@ -55,6 +88,13 @@ export function validateEventPayload(
       ? extractRepository(rawPayload.repository)
       : undefined;
     const actor = rawPayload.sender ? extractActor(rawPayload.sender) : undefined;
+    const metadata = extractWebhookMetadata({
+      deliveryId,
+      eventType: 'ping',
+      repository,
+      actor,
+      action: rawPayload.action,
+    });
 
     return {
       event: 'ping',
@@ -62,6 +102,7 @@ export function validateEventPayload(
       isPing: true,
       repository,
       actor,
+      metadata,
       payload: rawPayload,
     };
   }
@@ -73,6 +114,15 @@ export function validateEventPayload(
 
   const repository = extractRepository(rawPayload.repository);
   const actor = rawPayload.sender ? extractActor(rawPayload.sender) : undefined;
+  const action = typeof rawPayload.action === 'string' ? rawPayload.action : undefined;
+
+  const metadata = extractWebhookMetadata({
+    deliveryId,
+    eventType: event,
+    repository,
+    actor,
+    action,
+  });
 
   // 3. Event-specific validations
   switch (event) {
@@ -133,9 +183,10 @@ export function validateEventPayload(
     event: event as SupportedGitHubEvent,
     deliveryId,
     isPing: false,
-    action: rawPayload.action,
+    action,
     repository,
     actor,
+    metadata,
     payload: rawPayload,
   };
 }
