@@ -146,9 +146,27 @@ DevPulse exposes a dedicated, unauthenticated (`@Public()`) endpoint to receive 
 - **Status Code**: `202 Accepted` on successful receipt and signature verification.
 - **Headers Validated**:
   - `Content-Type`: Must be `application/json` (otherwise `400 Bad Request`).
-  - `X-GitHub-Event`: GitHub event type (e.g., `push`, `pull_request`, `ping`) (otherwise `400 Bad Request`).
+  - `X-GitHub-Event`: GitHub event type (e.g., `push`, `pull_request`, `pull_request_review`, `repository`, `ping`) (otherwise `400 Bad Request`).
   - `X-GitHub-Delivery`: Unique delivery GUID assigned by GitHub (otherwise `400 Bad Request`).
   - `X-Hub-Signature-256`: HMAC SHA-256 signature calculated with `GITHUB_WEBHOOK_SECRET` (otherwise `401 Unauthorized`).
+- **Supported Events**:
+  - `push`: Requires `ref`, `commits` list, and `repository` object.
+  - `pull_request`: Requires `action`, `pull_request` (id, number), and `repository`.
+  - `pull_request_review`: Requires `action`, `pull_request`, `review` (id, state), and `repository`.
+  - `repository`: Requires `action` and `repository`.
+  - `ping`: Initial ping hook verification, acknowledged immediately with `202 Accepted`.
+  - *Unsupported events*: Safely ignored with `202 Accepted` and `{ status: "ignored" }` to prevent unnecessary failure alerts on GitHub.
+- **Normalized Event Metadata Extracted**:
+  - `deliveryId`: Unique delivery GUID from `X-GitHub-Delivery`.
+  - `eventType`: Event name from `X-GitHub-Event`.
+  - `repositoryGitHubId` & `repositoryFullName`: Parsed from `repository.id` and `repository.full_name`.
+  - `senderGitHubId`: Parsed from `sender.id` where present.
+  - `action`: Event action (e.g., `opened`, `submitted`, `created`).
+  - `receivedAt`: High-resolution ingestion timestamp.
+- **Connected Account & Ownership Validation**:
+  - Senders and repositories are validated against connected accounts (`GitHubAccount.githubUserId`) and registered repositories (`Repository.githubId`) in PostgreSQL. Unverified IDs are never trusted directly.
+- **Asynchronous Architecture**:
+  - The webhook endpoint performs fast, non-blocking ingestion (<10ms) without triggering expensive synchronous database synchronizations or GitHub API roundtrips.
 - **Raw Body Verification**: Verification checks the exact raw request bytes before JSON parsing to guarantee signature accuracy.
 - **Security**: Error messages avoid leaking internal stack traces, configuration states, or signature values.
 
