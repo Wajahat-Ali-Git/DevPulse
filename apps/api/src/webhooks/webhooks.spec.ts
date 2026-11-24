@@ -157,14 +157,15 @@ async function runWebhookTests() {
     console.log('  ✔ Correctly rejects missing headers with 400 or 401');
   }
 
-  // Test 4: Invalid signature rejection without exposing internal details
-  console.log('\nTest 4: Signature verification failure');
+  // Test 4: Invalid, missing, or malformed signature rejection without exposing internal details
+  console.log('\nTest 4: Signature verification failure and malformed signatures');
   {
     const payload = { action: 'synchronize' };
     const rawPayload = JSON.stringify(payload);
-    const invalidSignature = 'sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
     const req = createMockReq(payload, rawPayload);
 
+    // Mismatched signature
+    const invalidSignature = 'sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
     await assert.rejects(
       async () => {
         await controller.handleGitHubWebhook(
@@ -181,11 +182,71 @@ async function runWebhookTests() {
         return true;
       },
     );
-    console.log('  ✔ Invalid HMAC signature rejected with 401 Unauthorized without leakage');
+
+    // Malformed signatures (missing sha256= prefix, invalid length, invalid hex)
+    const malformedSignatures = [
+      'invalid-signature-without-prefix',
+      'sha256=',
+      'sha256=12345',
+      'sha1=4328904832094823094823094823094823094823',
+      'sha256=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz',
+    ];
+
+    for (const malformedSig of malformedSignatures) {
+      await assert.rejects(
+        async () => {
+          await controller.handleGitHubWebhook(
+            req,
+            malformedSig,
+            'pull_request',
+            'delivery-uuid-malformed',
+            'application/json',
+          );
+        },
+        (err: any) => {
+          assert(err instanceof UnauthorizedException);
+          assert.strictEqual(err.message, 'Invalid webhook signature');
+          return true;
+        },
+      );
+    }
+
+    console.log('  ✔ Invalid and malformed HMAC signatures rejected with 401 Unauthorized without leakage');
   }
 
-  // Test 5: Raw body verification accuracy against tampered payload
-  console.log('\nTest 5: Tampered request body detection using rawBody');
+  // Test 5: Verify logger never logs webhook secrets or signature values
+  console.log('\nTest 5: Secret and signature leak prevention in logs and responses');
+  {
+    const payload = { action: 'opened' };
+    const rawPayload = JSON.stringify(payload);
+    const secretValue = 'super-secret-key-1234567890-abcdef';
+    const fakeSignature = 'sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    (config.github as any).webhookSecret = secretValue;
+
+    const req = createMockReq(payload, rawPayload);
+
+    let caughtError: any;
+    try {
+      await controller.handleGitHubWebhook(
+        req,
+        fakeSignature,
+        'issues',
+        'delivery-sec-1',
+        'application/json',
+      );
+    } catch (err) {
+      caughtError = err;
+    }
+
+    assert(caughtError instanceof UnauthorizedException);
+    const errorString = JSON.stringify(caughtError);
+    assert(!errorString.includes(secretValue), 'Secret leaked in error object!');
+    assert(!errorString.includes(fakeSignature), 'Signature leaked in error object!');
+    console.log('  ✔ Webhook secret and signature values are strictly never leaked');
+  }
+
+  // Test 6: Raw body verification accuracy against tampered payload
+  console.log('\nTest 6: Tampered request body detection using rawBody');
   {
     const originalBody = '{"action":"opened","number":1}';
     const tamperedBody = '{"action":"opened","number":2}';
@@ -200,7 +261,7 @@ async function runWebhookTests() {
           req,
           originalSignature,
           'pull_request',
-          'delivery-uuid-5',
+          'delivery-uuid-6',
           'application/json',
         );
       },
