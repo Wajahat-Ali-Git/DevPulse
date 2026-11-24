@@ -42,14 +42,25 @@ export class GitHubWebhooks {
    */
   static verifySignature(options: VerifyWebhookSignatureOptions): boolean {
     const { payload, signature, secret } = options;
-    if (!signature || !secret) {
+    if (!signature || typeof signature !== 'string' || !secret || typeof secret !== 'string') {
+      return false;
+    }
+
+    // GitHub signature must strictly adhere to the `sha256=<64-hex-chars>` format
+    const prefix = 'sha256=';
+    if (!signature.startsWith(prefix)) {
+      return false;
+    }
+
+    const hexDigest = signature.slice(prefix.length);
+    if (hexDigest.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(hexDigest)) {
       return false;
     }
 
     const expectedSignature = GitHubWebhooks.sign(payload, secret);
 
-    const sigBuffer = Buffer.from(signature);
-    const expectedBuffer = Buffer.from(expectedSignature);
+    const sigBuffer = Buffer.from(signature, 'utf8');
+    const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
 
     if (sigBuffer.length !== expectedBuffer.length) {
       return false;
