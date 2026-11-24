@@ -129,7 +129,7 @@ Webhooks provide real-time updates when commits are pushed, pull requests are op
 1. In your GitHub repository or organization, go to **Settings** > **Webhooks** > **Add webhook**.
 2. Configure the webhook settings:
    - **Payload URL**: `https://<your-domain-or-tunnel>/api/v1/webhooks/github`
-   - **Content type**: `application/json`
+   - **Content type**: `application/json` (strictly required)
    - **Secret**: Set a secure secret string matching `GITHUB_WEBHOOK_SECRET` in your `.env`.
    - **SSL verification**: Enable SSL verification.
 3. Select **Let me select individual events** and check:
@@ -140,7 +140,19 @@ Webhooks provide real-time updates when commits are pushed, pull requests are op
    - `Releases` (`release`)
 4. Save the webhook.
 
-### 5.2. Timing-Safe Signature Verification
+### 5.2. Webhook Ingestion & Validation Endpoint (`POST /api/v1/webhooks/github`)
+DevPulse exposes a dedicated, unauthenticated (`@Public()`) endpoint to receive incoming GitHub webhooks:
+- **Route**: `POST /api/v1/webhooks/github`
+- **Status Code**: `202 Accepted` on successful receipt and signature verification.
+- **Headers Validated**:
+  - `Content-Type`: Must be `application/json` (otherwise `400 Bad Request`).
+  - `X-GitHub-Event`: GitHub event type (e.g., `push`, `pull_request`, `ping`) (otherwise `400 Bad Request`).
+  - `X-GitHub-Delivery`: Unique delivery GUID assigned by GitHub (otherwise `400 Bad Request`).
+  - `X-Hub-Signature-256`: HMAC SHA-256 signature calculated with `GITHUB_WEBHOOK_SECRET` (otherwise `401 Unauthorized`).
+- **Raw Body Verification**: Verification checks the exact raw request bytes before JSON parsing to guarantee signature accuracy.
+- **Security**: Error messages avoid leaking internal stack traces, configuration states, or signature values.
+
+### 5.3. Timing-Safe Signature Verification
 To prevent timing side-channel attacks, `@devpulse/github` uses constant-time comparison via Node.js `crypto.timingSafeEqual`:
 
 ```typescript

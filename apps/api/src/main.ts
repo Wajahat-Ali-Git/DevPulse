@@ -14,6 +14,7 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule, {
     logger: nestLogger,
+    rawBody: true,
   });
 
   // Attach Correlation and Request Tracing Middleware
