@@ -664,6 +664,9 @@ async function runWebhookTests() {
           },
         },
         webhookDelivery: {
+          findUnique: async ({ where }: any) => {
+            return deliveryStorage.find(d => d.deliveryId === where.deliveryId) || null;
+          },
           upsert: async ({ where, create, update }: any) => {
             const idx = deliveryStorage.findIndex(d => d.deliveryId === where.deliveryId);
             if (idx >= 0) {
@@ -734,6 +737,125 @@ async function runWebhookTests() {
     assert.strictEqual(deliveryStorage.length, 1, 'Delivery ID must remain unique without duplicate rows');
 
     console.log('  ✔ WebhookDelivery model persists deliveryId, payload, timestamps, and status with unique deduplication');
+  }
+
+  // Test 14: Duplicate delivery detection and concurrent request handling
+  console.log('\nTest 14: Duplicate delivery protection and concurrent request handling');
+  {
+    const deliveryStore: any[] = [];
+    const enqueuedJobs: any[] = [];
+
+    const mockQueueService: any = {
+      addWebhookEventJob: async (payload: any, options: any) => {
+        const jobId = options?.jobId || payload.deliveryId;
+        if (enqueuedJobs.some(j => j.jobId === jobId)) {
+          return { enqueued: false, jobId };
+        }
+        enqueuedJobs.push({ jobId, payload });
+        return { enqueued: true, jobId };
+      },
+    };
+
+    const duplicateDb: any = {
+      client: {
+        repository: {
+          findFirst: async ({ where }: any) => {
+            if (where.githubId === BigInt(9999)) {
+              return { id: 'repo-dup-9999', workspaceId: 'ws-dup' };
+            }
+            return null;
+          },
+        },
+        gitHubAccount: {
+          findFirst: async () => null,
+        },
+        webhookDelivery: {
+          findUnique: async ({ where }: any) => {
+            return deliveryStore.find(d => d.deliveryId === where.deliveryId) || null;
+          },
+          upsert: async ({ where, create, update }: any) => {
+            const existing = deliveryStore.find(d => d.deliveryId === where.deliveryId);
+            if (existing) {
+              Object.assign(existing, update);
+              return existing;
+            }
+            const record = {
+              id: `whd-${deliveryStore.length + 1}`,
+              ...create,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            deliveryStore.push(record);
+            return record;
+          },
+        },
+      },
+    };
+
+    const service = new WebhooksService(duplicateDb, mockQueueService);
+    const controller = new WebhooksController(service);
+
+    const testPayload = {
+      action: 'opened',
+      pull_request: { id: 8888, number: 42 },
+      repository: { id: 9999, name: 'repo-dup', full_name: 'devpulse/repo-dup' },
+      sender: { id: 1111, login: 'dup-sender' },
+    };
+    const raw = JSON.stringify(testPayload);
+    const sig = GitHubWebhooks.sign(raw, secret);
+    const req = createMockReq(testPayload, raw);
+
+    // Initial delivery
+    const res1 = await controller.handleGitHubWebhook(
+      req,
+      sig,
+      'pull_request',
+      'delivery-concurrent-test-1',
+      'application/json',
+    );
+
+    assert.strictEqual(res1.status, 'accepted');
+    assert.strictEqual(res1.isDuplicate, false);
+    assert.strictEqual(res1.details?.enqueued, true);
+    assert.strictEqual(enqueuedJobs.length, 1);
+
+    // Second delivery of same deliveryId (e.g. GitHub retry or re-delivery)
+    const res2 = await controller.handleGitHubWebhook(
+      req,
+      sig,
+      'pull_request',
+      'delivery-concurrent-test-1',
+      'application/json',
+    );
+
+    assert.strictEqual(res2.status, 'accepted', 'Duplicate delivery must acknowledge success');
+    assert.strictEqual(res2.isDuplicate, true, 'Detected as duplicate delivery');
+    assert.strictEqual(enqueuedJobs.length, 1, 'Job must NOT be re-enqueued for duplicate delivery');
+
+    // Concurrent delivery simulation (simulating two identical requests racing at the same time)
+    const res3Promise = controller.handleGitHubWebhook(
+      req,
+      sig,
+      'pull_request',
+      'delivery-concurrent-race-2',
+      'application/json',
+    );
+    const res4Promise = controller.handleGitHubWebhook(
+      req,
+      sig,
+      'pull_request',
+      'delivery-concurrent-race-2',
+      'application/json',
+    );
+
+    const [res3, res4] = await Promise.all([res3Promise, res4Promise]);
+    assert.strictEqual(res3.status, 'accepted');
+    assert.strictEqual(res4.status, 'accepted');
+    // Exactly one job should be in the queue for 'delivery-concurrent-race-2'
+    const raceJobs = enqueuedJobs.filter(j => j.jobId === 'delivery-concurrent-race-2');
+    assert.strictEqual(raceJobs.length, 1, 'Only one job should be enqueued across concurrent identical requests');
+
+    console.log('  ✔ Duplicate delivery detection, safe concurrent handling, and single-job enqueueing verified');
   }
 
   console.log('\n✅ ALL GITHUB WEBHOOK ENDPOINT TESTS PASSED SUCCESSFULLY!\n');

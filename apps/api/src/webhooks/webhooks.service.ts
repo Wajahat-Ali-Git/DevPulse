@@ -3,6 +3,7 @@ import { config } from '@devpulse/config';
 import { GitHubWebhooks } from '@devpulse/github';
 import { Logger } from '@devpulse/logger';
 import { DatabaseService } from '../database.service';
+import { WebhooksQueueService } from './webhooks-queue.service';
 import {
   isSupportedGitHubEvent,
   validateEventPayload,
@@ -23,6 +24,7 @@ export interface WebhookResponse {
   event: string;
   delivery: string;
   status: 'accepted' | 'ignored';
+  isDuplicate?: boolean;
   deliveryRecordId?: string;
   metadata?: WebhookMetadata;
   details?: Record<string, any>;
@@ -32,7 +34,10 @@ export interface WebhookResponse {
 export class WebhooksService {
   private readonly logger = new Logger({ service: 'api', context: 'WebhooksService' });
 
-  constructor(private readonly database?: DatabaseService) {}
+  constructor(
+    private readonly database?: DatabaseService,
+    private readonly queueService?: WebhooksQueueService,
+  ) {}
 
   /**
    * Validates webhook signature using timingSafeEqual HMAC verification,
@@ -64,7 +69,46 @@ export class WebhooksService {
       throw new UnauthorizedException('Invalid webhook signature');
     }
 
-    // 2. Check if event is supported
+    // 2. Check for duplicate delivery in database
+    if (this.database?.client?.webhookDelivery) {
+      try {
+        const existingDelivery = await this.database.client.webhookDelivery.findUnique({
+          where: { deliveryId },
+          select: {
+            id: true,
+            status: true,
+            eventType: true,
+            createdAt: true,
+          },
+        });
+
+        if (existingDelivery) {
+          this.logger.info(`Detected duplicate delivery for deliveryId "${deliveryId}" (status: ${existingDelivery.status})`, {
+            deliveryId,
+            status: existingDelivery.status,
+            event,
+          });
+
+          return {
+            received: true,
+            event: existingDelivery.eventType || event,
+            delivery: deliveryId,
+            status: 'accepted',
+            isDuplicate: true,
+            deliveryRecordId: existingDelivery.id,
+            details: {
+              duplicate: true,
+              existingStatus: existingDelivery.status,
+              firstReceivedAt: existingDelivery.createdAt,
+            },
+          };
+        }
+      } catch (err) {
+        this.logger.warn(`Error checking existing webhook delivery [${deliveryId}]: ${(err as Error).message}`);
+      }
+    }
+
+    // 3. Check if event is supported
     if (!isSupportedGitHubEvent(event)) {
       this.logger.info(`Safely ignored unsupported GitHub webhook event: [${event}] (delivery: ${deliveryId})`, {
         event,
@@ -167,17 +211,13 @@ export class WebhooksService {
 
     // 6. Persist accepted event metadata and payload to WebhookDelivery
     let deliveryRecordId: string | undefined;
+    let isDuplicateDelivery = false;
     if (this.database?.client?.webhookDelivery) {
       try {
         const record = await this.database.client.webhookDelivery.upsert({
           where: { deliveryId },
           update: {
-            eventType: event,
-            action: validatedEvent.action,
-            repositoryId: trackedRepoId,
-            githubRepositoryId: repository?.githubRepoId,
-            senderGithubId: actor?.githubUserId,
-            payload: parsedJson,
+            // If another concurrent request inserted it first, update updatedAt without duplicating
             updatedAt: new Date(),
           },
           create: {
@@ -194,10 +234,44 @@ export class WebhooksService {
         });
         deliveryRecordId = record.id;
       } catch (err) {
-        this.logger.warn(`Failed to persist webhook delivery [${deliveryId}]: ${(err as Error).message}`, {
+        // Safe concurrent duplicate handling: P2002 Unique constraint violation
+        if ((err as any)?.code === 'P2002') {
+          isDuplicateDelivery = true;
+          this.logger.info(`Concurrent duplicate delivery caught by unique constraint for [${deliveryId}]`, {
+            deliveryId,
+          });
+          const existing = await this.database.client.webhookDelivery.findUnique({
+            where: { deliveryId },
+            select: { id: true },
+          });
+          deliveryRecordId = existing?.id;
+        } else {
+          this.logger.warn(`Failed to persist webhook delivery [${deliveryId}]: ${(err as Error).message}`, {
+            deliveryId,
+            event,
+          });
+        }
+      }
+    }
+
+    // 7. Enqueue webhook event to BullMQ if queue service is available
+    // Do NOT enqueue if this delivery was already processed or detected as duplicate
+    let enqueued = false;
+    if (this.queueService && !isDuplicateDelivery) {
+      try {
+        const result = await this.queueService.addWebhookEventJob({
           deliveryId,
           event,
+          action: validatedEvent.action,
+          repositoryId: trackedRepoId,
+          githubRepoId: repository ? Number(repository.githubRepoId) : undefined,
+          sender: actor?.username,
+          rawPayload: parsedJson,
+          receivedAt: validatedEvent.metadata.receivedAt.toISOString(),
         });
+        enqueued = result.enqueued;
+      } catch (queueErr) {
+        this.logger.warn(`Failed to enqueue webhook job for [${deliveryId}]: ${(queueErr as Error).message}`);
       }
     }
 
@@ -205,6 +279,7 @@ export class WebhooksService {
       event,
       deliveryId,
       deliveryRecordId,
+      enqueued,
       repo: repository?.fullName,
       trackedRepoId,
       connectedAccountId,
@@ -215,11 +290,13 @@ export class WebhooksService {
       event,
       delivery: deliveryId,
       status: 'accepted',
+      isDuplicate: isDuplicateDelivery,
       deliveryRecordId,
       metadata: validatedEvent.metadata,
       details: {
         repository: repository?.fullName,
         action: validatedEvent.action,
+        enqueued,
         isTracked: Boolean(trackedRepoId),
         hasConnectedAccount: Boolean(connectedAccountId),
       },
