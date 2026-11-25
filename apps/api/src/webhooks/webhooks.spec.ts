@@ -434,6 +434,7 @@ async function runWebhookTests() {
   // Test 9: Repository and actor account validation using mocked database
   console.log('\nTest 9: Repository and actor account ownership check against connected accounts');
   {
+    const mockDeliveries: any[] = [];
     const mockDb: any = {
       client: {
         repository: {
@@ -450,6 +451,29 @@ async function runWebhookTests() {
               return { id: 'db-gh-acc-202', userId: 'user-202' };
             }
             return null;
+          },
+        },
+        webhookDelivery: {
+          upsert: async ({ where, create, update }: any) => {
+            const existingIdx = mockDeliveries.findIndex(d => d.deliveryId === where.deliveryId);
+            if (existingIdx >= 0) {
+              mockDeliveries[existingIdx] = {
+                ...mockDeliveries[existingIdx],
+                ...update,
+                id: mockDeliveries[existingIdx].id,
+              };
+              return mockDeliveries[existingIdx];
+            } else {
+              const newRec = {
+                id: `whd_${mockDeliveries.length + 1}`,
+                ...create,
+              };
+              mockDeliveries.push(newRec);
+              return newRec;
+            }
+          },
+          findUnique: async ({ where }: any) => {
+            return mockDeliveries.find(d => d.deliveryId === where.deliveryId) || null;
           },
         },
       },
@@ -615,6 +639,101 @@ async function runWebhookTests() {
       'Public config must NEVER expose githubWebhookSecret',
     );
     console.log('  ✔ GITHUB_WEBHOOK_SECRET is strictly confined to server-side private configuration');
+  }
+
+  // Test 13: Webhook event delivery persistence in database
+  console.log('\nTest 13: WebhookDelivery model persistence with payload and metadata');
+  {
+    const deliveryStorage: any[] = [];
+    const persistenceMockDb: any = {
+      client: {
+        repository: {
+          findFirst: async ({ where }: any) => {
+            if (where.githubId === BigInt(5555)) {
+              return { id: 'repo-uuid-5555', workspaceId: 'ws-5555' };
+            }
+            return null;
+          },
+        },
+        gitHubAccount: {
+          findFirst: async ({ where }: any) => {
+            if (where.githubUserId === BigInt(6666)) {
+              return { id: 'gh-acc-6666', userId: 'user-6666' };
+            }
+            return null;
+          },
+        },
+        webhookDelivery: {
+          upsert: async ({ where, create, update }: any) => {
+            const idx = deliveryStorage.findIndex(d => d.deliveryId === where.deliveryId);
+            if (idx >= 0) {
+              deliveryStorage[idx] = { ...deliveryStorage[idx], ...update };
+              return deliveryStorage[idx];
+            }
+            const record = {
+              id: `whd-${deliveryStorage.length + 1}`,
+              ...create,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            deliveryStorage.push(record);
+            return record;
+          },
+        },
+      },
+    };
+
+    const persistenceService = new WebhooksService(persistenceMockDb);
+    const persistenceController = new WebhooksController(persistenceService);
+
+    const pullPayload = {
+      action: 'opened',
+      pull_request: { id: 7777, number: 101, title: 'Persistent PR' },
+      repository: { id: 5555, name: 'persisted-repo', full_name: 'devpulse/persisted-repo' },
+      sender: { id: 6666, login: 'persistent-author' },
+    };
+    const pullRaw = JSON.stringify(pullPayload);
+    const pullSig = GitHubWebhooks.sign(pullRaw, secret);
+    const pullReq = createMockReq(pullPayload, pullRaw);
+
+    const response = await persistenceController.handleGitHubWebhook(
+      pullReq,
+      pullSig,
+      'pull_request',
+      'delivery-persistent-uuid-1',
+      'application/json',
+    );
+
+    assert.strictEqual(response.status, 'accepted');
+    assert.strictEqual(response.delivery, 'delivery-persistent-uuid-1');
+    assert.strictEqual(response.deliveryRecordId, 'whd-1');
+
+    // Verify stored record
+    assert.strictEqual(deliveryStorage.length, 1);
+    const stored = deliveryStorage[0];
+    assert.strictEqual(stored.deliveryId, 'delivery-persistent-uuid-1');
+    assert.strictEqual(stored.eventType, 'pull_request');
+    assert.strictEqual(stored.action, 'opened');
+    assert.strictEqual(stored.repositoryId, 'repo-uuid-5555');
+    assert.strictEqual(stored.githubRepositoryId, BigInt(5555));
+    assert.strictEqual(stored.senderGithubId, BigInt(6666));
+    assert.strictEqual(stored.status, 'RECEIVED');
+    assert.deepStrictEqual(stored.payload, pullPayload);
+    assert(stored.receivedAt instanceof Date);
+
+    // Repeated delivery with same delivery ID (idempotent upsert)
+    const repeatResponse = await persistenceController.handleGitHubWebhook(
+      pullReq,
+      pullSig,
+      'pull_request',
+      'delivery-persistent-uuid-1',
+      'application/json',
+    );
+
+    assert.strictEqual(repeatResponse.deliveryRecordId, 'whd-1');
+    assert.strictEqual(deliveryStorage.length, 1, 'Delivery ID must remain unique without duplicate rows');
+
+    console.log('  ✔ WebhookDelivery model persists deliveryId, payload, timestamps, and status with unique deduplication');
   }
 
   console.log('\n✅ ALL GITHUB WEBHOOK ENDPOINT TESTS PASSED SUCCESSFULLY!\n');

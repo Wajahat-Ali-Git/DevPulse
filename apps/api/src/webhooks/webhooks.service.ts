@@ -23,6 +23,7 @@ export interface WebhookResponse {
   event: string;
   delivery: string;
   status: 'accepted' | 'ignored';
+  deliveryRecordId?: string;
   metadata?: WebhookMetadata;
   details?: Record<string, any>;
 }
@@ -96,11 +97,41 @@ export class WebhooksService {
       this.logger.info(`Processed GitHub ping event (zen: "${parsedJson.zen || 'none'}") (delivery: ${deliveryId})`, {
         deliveryId,
       });
+
+      let pingRecordId: string | undefined;
+      if (this.database?.client?.webhookDelivery) {
+        try {
+          const record = await this.database.client.webhookDelivery.upsert({
+            where: { deliveryId },
+            update: {
+              status: 'COMPLETED',
+              payload: parsedJson,
+              updatedAt: new Date(),
+            },
+            create: {
+              deliveryId,
+              eventType: 'ping',
+              action: parsedJson.action,
+              payload: parsedJson,
+              status: 'COMPLETED',
+              receivedAt: validatedEvent.metadata.receivedAt,
+              processedAt: new Date(),
+            },
+          });
+          pingRecordId = record.id;
+        } catch (err) {
+          this.logger.warn(`Failed to persist ping webhook delivery: ${(err as Error).message}`, {
+            deliveryId,
+          });
+        }
+      }
+
       return {
         received: true,
         event: 'ping',
         delivery: deliveryId,
         status: 'accepted',
+        deliveryRecordId: pingRecordId,
         metadata: validatedEvent.metadata,
         details: { zen: parsedJson.zen, hookId: parsedJson.hook_id },
       };
@@ -134,9 +165,46 @@ export class WebhooksService {
       }
     }
 
+    // 6. Persist accepted event metadata and payload to WebhookDelivery
+    let deliveryRecordId: string | undefined;
+    if (this.database?.client?.webhookDelivery) {
+      try {
+        const record = await this.database.client.webhookDelivery.upsert({
+          where: { deliveryId },
+          update: {
+            eventType: event,
+            action: validatedEvent.action,
+            repositoryId: trackedRepoId,
+            githubRepositoryId: repository?.githubRepoId,
+            senderGithubId: actor?.githubUserId,
+            payload: parsedJson,
+            updatedAt: new Date(),
+          },
+          create: {
+            deliveryId,
+            eventType: event,
+            action: validatedEvent.action,
+            repositoryId: trackedRepoId,
+            githubRepositoryId: repository?.githubRepoId,
+            senderGithubId: actor?.githubUserId,
+            payload: parsedJson,
+            status: 'RECEIVED',
+            receivedAt: validatedEvent.metadata.receivedAt,
+          },
+        });
+        deliveryRecordId = record.id;
+      } catch (err) {
+        this.logger.warn(`Failed to persist webhook delivery [${deliveryId}]: ${(err as Error).message}`, {
+          deliveryId,
+          event,
+        });
+      }
+    }
+
     this.logger.info(`Received verified GitHub event: [${event}] for repo "${repository?.fullName}" (delivery: ${deliveryId})`, {
       event,
       deliveryId,
+      deliveryRecordId,
       repo: repository?.fullName,
       trackedRepoId,
       connectedAccountId,
@@ -147,6 +215,7 @@ export class WebhooksService {
       event,
       delivery: deliveryId,
       status: 'accepted',
+      deliveryRecordId,
       metadata: validatedEvent.metadata,
       details: {
         repository: repository?.fullName,

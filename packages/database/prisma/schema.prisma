@@ -63,6 +63,14 @@ enum SyncRunStatus {
   CANCELLED
 }
 
+enum WebhookDeliveryStatus {
+  RECEIVED
+  PROCESSING
+  COMPLETED
+  FAILED
+  IGNORED
+}
+
 enum SyncRunType {
   USER_REPOSITORIES
   SINGLE_REPOSITORY
@@ -211,6 +219,7 @@ model Repository {
   commits        Commit[]
   pullRequests   PullRequest[]
   activityEvents ActivityEvent[]
+  webhookDeliveries WebhookDelivery[]
 
   @@index([workspaceId])
   @@index([fullName])
@@ -373,4 +382,32 @@ model SyncRun {
   @@index([workspaceId])
   @@index([createdAt])
   @@map("sync_runs")
+}
+
+model WebhookDelivery {
+  id                 String                @id @default(uuid())
+  deliveryId         String                @unique @map("delivery_id")
+  eventType          String                @map("event_type")
+  action             String?
+  repositoryId       String?               @map("repository_id")
+  githubRepositoryId BigInt?               @map("github_repository_id")
+  senderGithubId     BigInt?               @map("sender_github_id")
+  payload            Json
+  status             WebhookDeliveryStatus @default(RECEIVED)
+  receivedAt         DateTime              @default(now()) @map("received_at")
+  processedAt        DateTime?             @map("processed_at")
+  attemptCount       Int                   @default(0) @map("attempt_count")
+  errorMessage       String?               @map("error_message")
+  createdAt          DateTime              @default(now()) @map("created_at")
+  updatedAt          DateTime              @updatedAt @map("updated_at")
+
+  repository Repository? @relation(fields: [repositoryId], references: [id], onDelete: SetNull)
+
+  @@index([deliveryId])
+  @@index([eventType])
+  @@index([status])
+  @@index([repositoryId])
+  @@index([githubRepositoryId])
+  @@index([receivedAt])
+  @@map("webhook_deliveries")
 }
