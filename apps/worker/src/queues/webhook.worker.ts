@@ -5,6 +5,7 @@ import { CorrelationContext } from '@devpulse/logger';
 import { prisma, ActivityEventType } from '@devpulse/database';
 import { RedisService } from '../redis/redis.service';
 import { BaseWorker } from './base.worker';
+import { WebhookEventHandlers, WebhookEventHandlingResult } from '../processors/webhook-event.handlers';
 
 export interface WebhookJobResult {
   received: boolean;
@@ -12,6 +13,7 @@ export interface WebhookJobResult {
   eventType: string;
   activityEventId?: string;
   isDuplicate?: boolean;
+  handlingResult?: WebhookEventHandlingResult;
   processedAt: string;
 }
 
@@ -39,10 +41,30 @@ export class WebhookWorker extends BaseWorker<WebhookEventPayload, WebhookJobRes
         sender,
       });
 
+      // 1. Dispatch to dedicated event handlers by event type
+      let handlingResult: WebhookEventHandlingResult | undefined;
+      switch (event) {
+        case 'push':
+          handlingResult = await WebhookEventHandlers.handlePushEvent(job.data);
+          break;
+        case 'pull_request':
+          handlingResult = await WebhookEventHandlers.handlePullRequestEvent(job.data);
+          break;
+        case 'pull_request_review':
+          handlingResult = await WebhookEventHandlers.handlePullRequestReviewEvent(job.data);
+          break;
+        case 'repository':
+          handlingResult = await WebhookEventHandlers.handleRepositoryEvent(job.data);
+          break;
+        default:
+          this.logger.info(`No domain handler required for event type: ${event}`);
+          break;
+      }
+
       let activityEventId: string | undefined;
       let isDuplicate = false;
 
-      // Map GitHub event name to ActivityEventType enum
+      // 2. Map GitHub event name to ActivityEventType enum
       let activityEventType: ActivityEventType = ActivityEventType.OTHER;
       if (event === 'push') {
         activityEventType = ActivityEventType.PUSH;
@@ -55,19 +77,18 @@ export class WebhookWorker extends BaseWorker<WebhookEventPayload, WebhookJobRes
         activityEventType = ActivityEventType.PULL_REQUEST_REVIEW;
       }
 
-      // Deduplicate activity persistence using unique constraint on github_delivery
+      // 3. Deduplicate activity persistence using unique constraint on github_delivery
       if (prisma && prisma.activityEvent) {
         try {
           const activity = await prisma.activityEvent.upsert({
             where: { githubDelivery: deliveryId },
             update: {
-              // Idempotent: don't create duplicates on retries
               action,
               actorUsername: sender || 'unknown',
             },
             create: {
               githubDelivery: deliveryId,
-              repositoryId: repositoryId || null,
+              repositoryId: repositoryId || handlingResult?.repositoryId || null,
               eventType: activityEventType,
               action: action || null,
               actorUsername: sender || 'unknown',
@@ -86,7 +107,7 @@ export class WebhookWorker extends BaseWorker<WebhookEventPayload, WebhookJobRes
         }
       }
 
-      // Update WebhookDelivery status to COMPLETED
+      // 4. Update WebhookDelivery status to COMPLETED
       if (prisma && prisma.webhookDelivery) {
         try {
           await prisma.webhookDelivery.updateMany({
@@ -97,7 +118,7 @@ export class WebhookWorker extends BaseWorker<WebhookEventPayload, WebhookJobRes
             },
           });
         } catch {
-          // Non-blocking in tests or offline DB
+          // Non-blocking in offline DB or test mocks
         }
       }
 
@@ -107,9 +128,11 @@ export class WebhookWorker extends BaseWorker<WebhookEventPayload, WebhookJobRes
         eventType: event,
         activityEventId,
         isDuplicate,
+        handlingResult,
         processedAt: new Date().toISOString(),
       };
     });
   }
 }
+
 

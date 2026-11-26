@@ -233,13 +233,15 @@ export enum JobPriority {
  * Payload for GitHub webhook processing job.
  */
 export interface WebhookEventPayload {
+  deliveryDatabaseId?: string;
   deliveryId: string;
   event: string;
+  eventType?: string;
   action?: string;
   repositoryId?: string;
   githubRepoId?: number;
   sender?: string;
-  rawPayload: Record<string, any>;
+  rawPayload?: Record<string, any>;
   receivedAt: string;
 }
 

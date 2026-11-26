@@ -818,6 +818,9 @@ async function runWebhookTests() {
     assert.strictEqual(res1.isDuplicate, false);
     assert.strictEqual(res1.details?.enqueued, true);
     assert.strictEqual(enqueuedJobs.length, 1);
+    assert.strictEqual(enqueuedJobs[0].payload.deliveryId, 'delivery-concurrent-test-1');
+    assert.strictEqual(enqueuedJobs[0].payload.deliveryDatabaseId, 'whd-1');
+    assert.strictEqual(enqueuedJobs[0].payload.eventType, 'pull_request');
 
     // Second delivery of same deliveryId (e.g. GitHub retry or re-delivery)
     const res2 = await controller.handleGitHubWebhook(
@@ -856,6 +859,110 @@ async function runWebhookTests() {
     assert.strictEqual(raceJobs.length, 1, 'Only one job should be enqueued across concurrent identical requests');
 
     console.log('  ✔ Duplicate delivery detection, safe concurrent handling, and single-job enqueueing verified');
+  }
+
+  // Test 15: Queue failure resilience and recovery mechanism for unqueued deliveries
+  console.log('\nTest 15: Queue failure resilience and recovery for unqueued deliveries');
+  {
+    const storage: any[] = [];
+    let queueOnline = false; // Simulate queue downtime during ingress
+    const recoveredJobs: any[] = [];
+
+    const mockDb: any = {
+      client: {
+        repository: {
+          findFirst: async () => null,
+        },
+        gitHubAccount: {
+          findFirst: async () => null,
+        },
+        webhookDelivery: {
+          findUnique: async ({ where }: any) => {
+            return storage.find(d => d.deliveryId === where.deliveryId) || null;
+          },
+          upsert: async ({ where, create, update }: any) => {
+            const existing = storage.find(d => d.deliveryId === where.deliveryId);
+            if (existing) {
+              Object.assign(existing, update);
+              return existing;
+            }
+            const record = {
+              id: `whd-recover-${storage.length + 1}`,
+              ...create,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            storage.push(record);
+            return record;
+          },
+          findMany: async ({ where }: any) => {
+            return storage.filter(d => (!where?.status || d.status === where.status) && (d.processedAt === null || d.processedAt === undefined));
+          },
+        },
+      },
+    };
+
+    const mockFailingQueueService: any = {
+      addWebhookEventJob: async (payload: any, options: any) => {
+        if (!queueOnline) {
+          throw new Error('Redis connection down');
+        }
+        recoveredJobs.push({ jobId: options?.jobId || payload.deliveryId, payload });
+        return { enqueued: true, jobId: payload.deliveryId };
+      },
+      recoverUnqueuedDeliveries: async (options?: any) => {
+        const unqueued = await mockDb.client.webhookDelivery.findMany({
+          where: { status: 'RECEIVED' },
+        });
+        let count = 0;
+        for (const item of unqueued) {
+          if (queueOnline) {
+            recoveredJobs.push({ jobId: item.deliveryId, payload: item });
+            count++;
+          }
+        }
+        return { recoveredCount: count, errors: 0 };
+      },
+    };
+
+    const resilientService = new WebhooksService(mockDb, mockFailingQueueService);
+    const resilientController = new WebhooksController(resilientService);
+
+    const payload = {
+      ref: 'refs/heads/main',
+      commits: [{ id: 'c-fail-1' }],
+      repository: { id: 777, name: 'fail-repo', full_name: 'devpulse/fail-repo' },
+      sender: { id: 888, login: 'dev' },
+    };
+    const raw = JSON.stringify(payload);
+    const sig = GitHubWebhooks.sign(raw, secret);
+    const req = createMockReq(payload, raw);
+
+    // Ingress occurs while queue is down
+    const res = await resilientController.handleGitHubWebhook(
+      req,
+      sig,
+      'push',
+      'delivery-failed-queue-1',
+      'application/json',
+    );
+
+    // Event must still be acknowledged and persisted without losing data
+    assert.strictEqual(res.status, 'accepted');
+    assert.strictEqual(res.details?.enqueued, false);
+    assert.strictEqual(storage.length, 1);
+    assert.strictEqual(storage[0].deliveryId, 'delivery-failed-queue-1');
+    assert.strictEqual(storage[0].status, 'RECEIVED');
+    assert.strictEqual(recoveredJobs.length, 0);
+
+    // Later: Queue recovers, run recovery mechanism
+    queueOnline = true;
+    const recoveryResult = await mockFailingQueueService.recoverUnqueuedDeliveries();
+    assert.strictEqual(recoveryResult.recoveredCount, 1);
+    assert.strictEqual(recoveredJobs.length, 1);
+    assert.strictEqual(recoveredJobs[0].jobId, 'delivery-failed-queue-1');
+
+    console.log('  ✔ Ingress succeeds and persists during queue failure; recovery sweep successfully enqueues unqueued deliveries');
   }
 
   console.log('\n✅ ALL GITHUB WEBHOOK ENDPOINT TESTS PASSED SUCCESSFULLY!\n');

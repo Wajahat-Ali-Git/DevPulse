@@ -188,13 +188,50 @@ if (!isValid) {
 ```
 
 ### 5.3. Idempotency & Delivery Guarantees
-GitHub sends a unique delivery GUID in the `X-GitHub-Delivery` header. DevPulse tracks this in the `activity_events` database table:
-- **Column**: `github_delivery` (`VARCHAR(255) UNIQUE`)
-- **Behavior**: If GitHub re-transmits a webhook event, the database unique constraint prevents duplicate processing and state corruption.
+GitHub sends a unique delivery GUID in the `X-GitHub-Delivery` header. DevPulse guarantees idempotent processing using:
+- **`WebhookDelivery` Model**: Persists delivery records with a unique constraint on `deliveryId`.
+  - Duplicate delivery IDs from GitHub are detected at ingestion and acknowledged with 200/202 without re-enqueuing duplicate jobs.
+  - Safe concurrent insertion handling ensures simultaneous duplicate deliveries do not cause race conditions.
+  - BullMQ jobs use stable identifiers (`jobId = deliveryId`) so repeated enqueues are ignored by the queue manager.
+- **Entities Deduplication**: Downstream event handlers use database unique constraints:
+  - Commits: `(repositoryId, sha)`
+  - Pull Requests: `githubId` and `(repositoryId, number)`
+  - Reviews: `githubId`
+  - Webhook delivery retry attempts update existing records rather than creating duplicates.
 
 ---
 
-## 6. Rate Limiting & Resilience
+## 6. Asynchronous Webhook Event Processing
+
+DevPulse processes supported webhook event types in background workers (`@devpulse/worker`) via the `github-webhooks` BullMQ queue.
+
+### 6.1. Supported Event Types & Handlers
+
+Webhook event handling is implemented by `WebhookEventHandlers` (`apps/worker/src/processors/webhook-event.handlers.ts`):
+
+1. **Push Events (`push`)**:
+   - Validates repository ownership against connected GitHub accounts.
+   - Extracts commit references and upserts commit records (`repositoryId`, `sha`, `message`, `authorName`, `authorEmail`, `authoredAt`).
+   - Updates repository activity timestamps (`pushedAt`, `lastSyncedAt`, `lastCommitSyncAt`).
+2. **Pull Request Events (`pull_request`)**:
+   - Handles actions: `opened`, `edited`, `synchronized`, `reopened`, `closed`.
+   - Distinguishes **`MERGED`** vs merely **`CLOSED`**: PRs with `merged_at` or `merged: true` are recorded as `MERGED` with `isMerged: true`. Unmerged closed PRs are recorded as `CLOSED` with `isMerged: false`.
+   - Upserts PR metadata: title, body, state, source/target branches (`head.ref`, `base.ref`), author, draft status, and timestamps.
+3. **Pull Request Review Events (`pull_request_review`)**:
+   - Handles review actions: `submitted`, `edited`, `dismissed`.
+   - Maps GitHub review states to `ReviewState` enum (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`).
+   - Persists review metadata: author username, commit SHA, submitted timestamp, and review body.
+4. **Repository Lifecycle Events (`repository`)**:
+   - Handles lifecycle actions: `archived`, `unarchived`, `deleted`, `renamed`.
+   - Updates repository operational status: `ARCHIVED`, `ACTIVE`, or `INACTIVE` (`deleted`).
+   - Updates repository metadata (name, full name, private visibility).
+5. **Ping & Untracked Events**:
+   - GitHub ping events are handled cleanly during ingestion.
+   - Events for repositories not connected to any DevPulse workspace are safely ignored with status `IGNORED` without mutating database state or failing the worker.
+
+---
+
+## 7. Rate Limiting & Resilience
 
 GitHub enforces rate limits (e.g., 5,000 requests per hour for authenticated requests). The `@devpulse/github` package includes built-in safeguards:
 

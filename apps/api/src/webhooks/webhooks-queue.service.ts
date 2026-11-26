@@ -3,6 +3,7 @@ import { Queue, ConnectionOptions } from 'bullmq';
 import { QueueName, JobName, WebhookEventPayload } from '@devpulse/types';
 import { Logger } from '@devpulse/logger';
 import { RedisService } from '../redis.service';
+import { DatabaseService } from '../database.service';
 
 export interface WebhookEnqueueOptions {
   jobId: string;
@@ -10,14 +11,21 @@ export interface WebhookEnqueueOptions {
   priority?: number;
 }
 
+export interface RecoverUnqueuedDeliveriesOptions {
+  batchSize?: number;
+  maxAgeMinutes?: number;
+}
+
 /**
  * Dedicated BullMQ queue service for GitHub webhook events.
  *
  * Configures the `github-webhooks` BullMQ Queue with:
  * - Shared Redis connection from RedisService
- * - Default retry and exponential backoff policies
- * - Strict job deduplication using deliveryId as jobId
+ * - Default retry policy: 5 attempts with exponential backoff (starting at 1000ms)
+ * - Strict job deduplication using deliveryId as stable jobId
  * - Automated completed/failed job cleanup retention
+ * - Failure handling preserving database records
+ * - Automated recovery mechanism for persisted but unqueued deliveries
  * - Graceful lifecycle teardown on module destruction
  */
 @Injectable()
@@ -25,7 +33,10 @@ export class WebhooksQueueService implements OnModuleDestroy {
   private readonly logger = new Logger({ service: 'api', context: WebhooksQueueService.name });
   private queue?: Queue;
 
-  constructor(private readonly redisService?: RedisService) {}
+  constructor(
+    private readonly redisService?: RedisService,
+    private readonly database?: DatabaseService,
+  ) {}
 
   public getQueue(): Queue {
     if (!this.queue) {
@@ -33,10 +44,10 @@ export class WebhooksQueueService implements OnModuleDestroy {
       this.queue = new Queue(QueueName.GITHUB_WEBHOOKS, {
         connection,
         defaultJobOptions: {
-          attempts: 3,
+          attempts: 5,
           backoff: {
             type: 'exponential',
-            delay: 1000,
+            delay: 1000, // 1s, 2s, 4s, 8s, 16s
           },
           removeOnComplete: {
             count: 2000,
@@ -55,14 +66,15 @@ export class WebhooksQueueService implements OnModuleDestroy {
   }
 
   /**
-   * Enqueues a webhook event to BullMQ using deliveryId as the jobId to guarantee
-   * queue-level deduplication and prevent concurrent or duplicate jobs.
+   * Enqueues a webhook event to BullMQ using deliveryId as stable jobId.
+   * Handles queue failures safely without losing the persisted delivery.
    */
   async addWebhookEventJob(
     payload: WebhookEventPayload,
     options?: Partial<WebhookEnqueueOptions>,
   ): Promise<{ enqueued: boolean; jobId: string }> {
     const queue = this.getQueue();
+    // Stable identifier: use deliveryId as jobId
     const jobId = options?.jobId || payload.deliveryId;
 
     try {
@@ -72,18 +84,87 @@ export class WebhooksQueueService implements OnModuleDestroy {
         delay: options?.delay,
       });
 
-      this.logger.info(`Enqueued webhook event job [${job.id}] for delivery "${payload.deliveryId}" (event: ${payload.event})`, {
+      this.logger.info(`Enqueued webhook event job [${job.id}] for delivery "${payload.deliveryId}" (event: ${payload.event || payload.eventType})`, {
         jobId: job.id,
         deliveryId: payload.deliveryId,
-        event: payload.event,
+        deliveryDatabaseId: payload.deliveryDatabaseId,
+        event: payload.event || payload.eventType,
       });
 
       return { enqueued: true, jobId: job.id! };
     } catch (err) {
-      // BullMQ safely ignores or throws on duplicate jobId depending on options
-      this.logger.warn(`Webhook job already exists or could not be re-enqueued for delivery [${payload.deliveryId}]: ${(err as Error).message}`);
+      // If queue failure occurs (e.g. Redis disconnect or job already exists),
+      // the delivery record in PostgreSQL remains safely intact.
+      this.logger.warn(`Webhook job already exists or queue dispatch failed for delivery [${payload.deliveryId}]: ${(err as Error).message}`);
       return { enqueued: false, jobId };
     }
+  }
+
+  /**
+   * Recovery mechanism: scans for persisted deliveries in status 'RECEIVED'
+   * that have not been processed or queued, and re-enqueues them to BullMQ.
+   */
+  async recoverUnqueuedDeliveries(options?: RecoverUnqueuedDeliveriesOptions): Promise<{ recoveredCount: number; errors: number }> {
+    if (!this.database?.client?.webhookDelivery) {
+      return { recoveredCount: 0, errors: 0 };
+    }
+
+    const batchSize = options?.batchSize || 50;
+    const maxAgeMinutes = options?.maxAgeMinutes || 5;
+    const thresholdDate = new Date(Date.now() - maxAgeMinutes * 60 * 1000);
+
+    let recoveredCount = 0;
+    let errors = 0;
+
+    try {
+      // Find unqueued/pending deliveries created before thresholdDate or recently received
+      const unqueued = await this.database.client.webhookDelivery.findMany({
+        where: {
+          status: 'RECEIVED',
+          processedAt: null,
+          receivedAt: {
+            lte: thresholdDate,
+          },
+        },
+        take: batchSize,
+        orderBy: { receivedAt: 'asc' },
+      });
+
+      if (unqueued.length === 0) {
+        return { recoveredCount: 0, errors: 0 };
+      }
+
+      this.logger.info(`Starting recovery sweep for ${unqueued.length} unqueued webhook deliverie(s)`);
+
+      for (const delivery of unqueued) {
+        try {
+          const res = await this.addWebhookEventJob({
+            deliveryDatabaseId: delivery.id,
+            deliveryId: delivery.deliveryId,
+            event: delivery.eventType,
+            eventType: delivery.eventType,
+            action: delivery.action || undefined,
+            repositoryId: delivery.repositoryId || undefined,
+            githubRepoId: delivery.githubRepositoryId ? Number(delivery.githubRepositoryId) : undefined,
+            rawPayload: delivery.payload as any,
+            receivedAt: delivery.receivedAt.toISOString(),
+          });
+
+          if (res.enqueued) {
+            recoveredCount++;
+          }
+        } catch (enqueueErr) {
+          errors++;
+          this.logger.error(`Failed to recover unqueued delivery [${delivery.deliveryId}]: ${(enqueueErr as Error).message}`);
+        }
+      }
+
+      this.logger.info(`Recovery sweep finished: ${recoveredCount} enqueued, ${errors} errors`);
+    } catch (err) {
+      this.logger.error(`Error querying unqueued webhook deliveries for recovery: ${(err as Error).message}`);
+    }
+
+    return { recoveredCount, errors };
   }
 
   async onModuleDestroy() {

@@ -260,8 +260,10 @@ export class WebhooksService {
     if (this.queueService && !isDuplicateDelivery) {
       try {
         const result = await this.queueService.addWebhookEventJob({
+          deliveryDatabaseId: deliveryRecordId,
           deliveryId,
           event,
+          eventType: event,
           action: validatedEvent.action,
           repositoryId: trackedRepoId,
           githubRepoId: repository ? Number(repository.githubRepoId) : undefined,
