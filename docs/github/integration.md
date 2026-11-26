@@ -314,3 +314,72 @@ The test suite verifies:
 - OAuth authorization URL construction
 - Webhook signature verification and invalid signature rejection
 - Rate limit parsing and error hierarchy
+
+---
+
+## 9. Webhook Event Processing & Troubleshooting Guide
+
+### 9.1. Webhook Delivery States Lifecycle
+
+Each incoming GitHub delivery progresses through well-defined lifecycle states recorded in the `webhook_deliveries` table:
+
+```
+[ GitHub ]
+    │
+    ▼ POST /api/v1/webhooks/github (HMAC SHA-256 verified)
+┌──────────────┐
+│   RECEIVED   │ ◄── Durably persisted to PostgreSQL before HTTP 202 acknowledgement
+└──────┬───────┘
+       │
+       ▼ Enqueued to BullMQ 'github-webhooks'
+┌──────────────┐
+│    QUEUED    │ ◄── Stable BullMQ jobId = deliveryId
+└──────┬───────┘
+       │
+       ▼ Worker dequeues job & increments attemptCount
+┌──────────────┐
+│  PROCESSING  │
+└──────┬───────┘
+       ├─────────────────────────────────┐
+       │ (Success)                       │ (Failure)
+       ▼                                 ▼
+┌──────────────┐                 ┌──────────────┐
+│  COMPLETED   │                 │    FAILED    │ ◄── Permanent failure or retries exhausted (5)
+└──────────────┘                 └──────┬───────┘
+                                        │
+                                        ▼ POST /api/v1/webhooks/deliveries/:id/reprocess
+                                 ┌──────────────┐
+                                 │    QUEUED    │ ◄── Re-enqueued with fresh correlation tracking
+                                 └──────────────┘
+```
+
+### 9.2. Troubleshooting Common Webhook Issues
+
+#### 1. Delivery Marked as `FAILED`
+- **Symptom**: `WebhookDelivery.status` is `FAILED` with an `errorMessage`.
+- **Diagnosis**: Inspect error message and `attemptCount` via:
+  ```http
+  GET /api/v1/webhooks/deliveries/:deliveryIdOrUuid
+  ```
+- **Resolution**:
+  - If failure was transient (network hiccup, upstream GitHub API outage, temporary database lock), trigger safe reprocessing:
+    ```http
+    POST /api/v1/webhooks/deliveries/:deliveryIdOrUuid/reprocess
+    ```
+  - If failure was permanent (`UnrecoverableError` due to untracked repository or schema violation), verify whether the repository is linked in the DevPulse workspace.
+
+#### 2. Delivery Stuck in `RECEIVED` (Persisted but Unqueued)
+- **Symptom**: Delivery was accepted during a Redis outage and never queued.
+- **Diagnosis**: `status = 'RECEIVED'` with `processedAt = null`.
+- **Resolution**: The system automatically sweeps unqueued deliveries on API startup. To trigger an immediate manual recovery sweep:
+  ```http
+  POST /api/v1/webhooks/deliveries/recover
+  ```
+
+#### 3. Worker Crash During Execution (Stuck in `PROCESSING`)
+- **Symptom**: Worker was abruptly terminated (e.g. host reboot or OOM kill) while processing.
+- **Resolution**: `WebhookWorker.recoverStuckProcessingDeliveries()` automatically scans on worker startup for deliveries stuck in `PROCESSING` longer than 15 minutes, safely resetting them to `QUEUED` for immediate processing or marking them `FAILED` if max attempts were exhausted.
+
+#### 4. Duplicate Delivery Handling
+- **Symptom**: GitHub re-sends the same event delivery GUID (`X-GitHub-Delivery`).
+- **Behavior**: Ingress detects the existing `deliveryId` in the database, returns HTTP 200/202, and skips queueing. Activity records and domain entities (`commits`, `pull_requests`, `reviews`) are protected by database uniqueness constraints, guaranteeing zero duplicate data.
