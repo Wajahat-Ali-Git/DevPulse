@@ -304,4 +304,31 @@ export class WebhooksService {
       },
     };
   }
+
+  /**
+   * Safely reprocesses a failed delivery by ID or deliveryId.
+   */
+  async reprocessFailedDelivery(idOrDeliveryId: string) {
+    if (!this.queueService) {
+      throw new Error('Webhooks queue service is unavailable');
+    }
+    return await this.queueService.reprocessFailedDelivery(idOrDeliveryId);
+  }
+
+  /**
+   * Retrieves a webhook delivery record with its status and attempt metadata.
+   */
+  async getDelivery(idOrDeliveryId: string): Promise<any | null> {
+    if (!this.database?.client?.webhookDelivery) {
+      return null;
+    }
+    return await this.database.client.webhookDelivery.findFirst({
+      where: {
+        OR: [
+          { id: idOrDeliveryId },
+          { deliveryId: idOrDeliveryId },
+        ],
+      },
+    });
+  }
 }

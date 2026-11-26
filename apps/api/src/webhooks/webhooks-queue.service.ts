@@ -36,7 +36,7 @@ export class WebhooksQueueService implements OnModuleDestroy {
   constructor(
     private readonly redisService?: RedisService,
     private readonly database?: DatabaseService,
-  ) {}
+  ) { }
 
   public getQueue(): Queue {
     if (!this.queue) {
@@ -84,6 +84,23 @@ export class WebhooksQueueService implements OnModuleDestroy {
         delay: options?.delay,
       });
 
+      // Update WebhookDelivery status to QUEUED if database client is available
+      if (this.database?.client?.webhookDelivery) {
+        try {
+          await this.database.client.webhookDelivery.updateMany({
+            where: {
+              deliveryId: payload.deliveryId,
+              status: { in: ['RECEIVED', 'FAILED'] },
+            },
+            data: {
+              status: 'QUEUED',
+            },
+          });
+        } catch (dbErr) {
+          this.logger.warn(`Failed to transition delivery [${payload.deliveryId}] to QUEUED: ${(dbErr as Error).message}`);
+        }
+      }
+
       this.logger.info(`Enqueued webhook event job [${job.id}] for delivery "${payload.deliveryId}" (event: ${payload.event || payload.eventType})`, {
         jobId: job.id,
         deliveryId: payload.deliveryId,
@@ -117,7 +134,7 @@ export class WebhooksQueueService implements OnModuleDestroy {
     let errors = 0;
 
     try {
-      // Find unqueued/pending deliveries created before thresholdDate or recently received
+      // Find unqueued/pending deliveries created before thresholdDate or recently received in status RECEIVED
       const unqueued = await this.database.client.webhookDelivery.findMany({
         where: {
           status: 'RECEIVED',
@@ -172,6 +189,88 @@ export class WebhooksQueueService implements OnModuleDestroy {
       this.logger.info(`Gracefully closing BullMQ queue: [${QueueName.GITHUB_WEBHOOKS}]`);
       await this.queue.close();
       this.queue = undefined;
+    }
+  }
+
+  /**
+   * Safely reprocesses a failed delivery by ID or deliveryId.
+   * Resets status from FAILED to QUEUED and re-enqueues the job to BullMQ.
+   */
+  async reprocessFailedDelivery(idOrDeliveryId: string): Promise<{ success: boolean; deliveryId: string; message: string }> {
+    if (!this.database?.client?.webhookDelivery) {
+      return { success: false, deliveryId: idOrDeliveryId, message: 'Database client not available' };
+    }
+
+    const delivery = await this.database.client.webhookDelivery.findFirst({
+      where: {
+        OR: [
+          { id: idOrDeliveryId },
+          { deliveryId: idOrDeliveryId },
+        ],
+      },
+    });
+
+    if (!delivery) {
+      return { success: false, deliveryId: idOrDeliveryId, message: `Webhook delivery not found: ${idOrDeliveryId}` };
+    }
+
+    if (delivery.status !== 'FAILED') {
+      return {
+        success: false,
+        deliveryId: delivery.deliveryId,
+        message: `Delivery is currently in status "${delivery.status}", only FAILED deliveries can be reprocessed`,
+      };
+    }
+
+    // Reset status to QUEUED and clear errorMessage
+    await this.database.client.webhookDelivery.update({
+      where: { id: delivery.id },
+      data: {
+        status: 'QUEUED',
+        errorMessage: null,
+      },
+    });
+
+    // Remove any stalled job from BullMQ queue with this jobId so it can be cleanly re-added
+    try {
+      const queue = this.getQueue();
+      const existingJob = await queue.getJob(delivery.deliveryId);
+      if (existingJob) {
+        await existingJob.remove();
+      }
+    } catch (removeErr) {
+      this.logger.warn(`Could not remove existing BullMQ job for delivery [${delivery.deliveryId}]: ${(removeErr as Error).message}`);
+    }
+
+    const result = await this.addWebhookEventJob({
+      deliveryDatabaseId: delivery.id,
+      deliveryId: delivery.deliveryId,
+      event: delivery.eventType,
+      eventType: delivery.eventType,
+      action: delivery.action || undefined,
+      repositoryId: delivery.repositoryId || undefined,
+      githubRepoId: delivery.githubRepositoryId ? Number(delivery.githubRepositoryId) : undefined,
+      rawPayload: delivery.payload as any,
+      receivedAt: delivery.receivedAt.toISOString(),
+      correlationId: `reprocess_${delivery.deliveryId}_${Date.now()}`,
+    });
+
+    if (result.enqueued) {
+      this.logger.info(`Successfully reprocessed and re-enqueued failed delivery [${delivery.deliveryId}]`, {
+        deliveryId: delivery.deliveryId,
+        id: delivery.id,
+      });
+      return { success: true, deliveryId: delivery.deliveryId, message: 'Successfully re-enqueued for processing' };
+    } else {
+      // Revert status back to FAILED if queue failed
+      await this.database.client.webhookDelivery.update({
+        where: { id: delivery.id },
+        data: {
+          status: 'FAILED',
+          errorMessage: 'Failed to re-enqueue to BullMQ queue',
+        },
+      });
+      return { success: false, deliveryId: delivery.deliveryId, message: 'Failed to re-enqueue to BullMQ queue' };
     }
   }
 }

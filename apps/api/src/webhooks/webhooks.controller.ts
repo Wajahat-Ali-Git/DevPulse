@@ -1,15 +1,18 @@
 import {
   Controller,
+  Get,
   Post,
+  Param,
   Headers,
   Req,
   HttpCode,
   HttpStatus,
   BadRequestException,
   UnauthorizedException,
+  NotFoundException,
 } from '@nestjs/common';
 import { Request } from 'express';
-import { Public } from '../auth/decorators/auth.decorators';
+import { Public, Roles } from '../auth/decorators/auth.decorators';
 import { WebhooksService } from './webhooks.service';
 import { Logger } from '@devpulse/logger';
 
@@ -17,7 +20,7 @@ import { Logger } from '@devpulse/logger';
 export class WebhooksController {
   private readonly logger = new Logger({ service: 'api', context: 'WebhooksController' });
 
-  constructor(private readonly webhooksService: WebhooksService) {}
+  constructor(private readonly webhooksService: WebhooksService) { }
 
   @Public()
   @Post('github')
@@ -66,10 +69,10 @@ export class WebhooksController {
       rawBody !== undefined
         ? rawBody
         : typeof req.body === 'string'
-        ? req.body
-        : Buffer.isBuffer(req.body)
-        ? req.body
-        : JSON.stringify(req.body || {});
+          ? req.body
+          : Buffer.isBuffer(req.body)
+            ? req.body
+            : JSON.stringify(req.body || {});
 
     // 4. Verification and Ingestion
     return await this.webhooksService.processGitHubWebhook({
@@ -79,5 +82,48 @@ export class WebhooksController {
       event,
       deliveryId,
     });
+  }
+
+  /**
+   * Safe reprocessing endpoint for failed webhook deliveries.
+   */
+  @Roles('ADMIN')
+  @Post('deliveries/:id/reprocess')
+  @HttpCode(HttpStatus.OK)
+  async reprocessDelivery(@Param('id') id: string) {
+    const result = await this.webhooksService.reprocessFailedDelivery(id);
+    if (!result.success && result.message.includes('not found')) {
+      throw new NotFoundException(result.message);
+    }
+    if (!result.success) {
+      throw new BadRequestException(result.message);
+    }
+    return result;
+  }
+
+  /**
+   * Retrieves status and details for a webhook delivery by UUID or deliveryId.
+   */
+  @Roles('ADMIN')
+  @Get('deliveries/:id')
+  async getDelivery(@Param('id') id: string) {
+    const delivery = await this.webhooksService.getDelivery(id);
+    if (!delivery) {
+      throw new NotFoundException(`Webhook delivery not found: ${id}`);
+    }
+    return {
+      id: delivery.id,
+      deliveryId: delivery.deliveryId,
+      eventType: delivery.eventType,
+      action: delivery.action,
+      repositoryId: delivery.repositoryId,
+      status: delivery.status,
+      attemptCount: delivery.attemptCount,
+      errorMessage: delivery.errorMessage,
+      receivedAt: delivery.receivedAt,
+      processedAt: delivery.processedAt,
+      createdAt: delivery.createdAt,
+      updatedAt: delivery.updatedAt,
+    };
   }
 }

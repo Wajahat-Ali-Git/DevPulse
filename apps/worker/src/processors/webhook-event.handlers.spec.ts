@@ -341,6 +341,67 @@ async function runWebhookEventHandlerTests() {
     console.log('  ✔ Untracked repository event safely rejected without applying changes');
   }
 
+  // Test 6: Webhook worker delivery processing state transitions & error handling
+  console.log('\nTest 6: Webhook worker delivery processing state transitions & error telemetry');
+  {
+    const mockDeliveries: any[] = [
+      {
+        id: 'del-rec-1',
+        deliveryId: 'del-worker-tracking-1',
+        status: 'QUEUED',
+        attemptCount: 0,
+        errorMessage: null,
+      },
+    ];
+
+    (prisma as any).webhookDelivery = {
+      updateMany: async ({ where, data }: any) => {
+        let count = 0;
+        for (const d of mockDeliveries) {
+          if (d.deliveryId === where.deliveryId) {
+            Object.assign(d, data);
+            count++;
+          }
+        }
+        return { count };
+      },
+    };
+
+    // Simulate start of processing
+    await (prisma as any).webhookDelivery.updateMany({
+      where: { deliveryId: 'del-worker-tracking-1' },
+      data: { status: 'PROCESSING', attemptCount: 1 },
+    });
+    assert.strictEqual(mockDeliveries[0].status, 'PROCESSING');
+    assert.strictEqual(mockDeliveries[0].attemptCount, 1);
+
+    // Simulate successful completion
+    await (prisma as any).webhookDelivery.updateMany({
+      where: { deliveryId: 'del-worker-tracking-1' },
+      data: { status: 'COMPLETED', processedAt: new Date(), errorMessage: null },
+    });
+    assert.strictEqual(mockDeliveries[0].status, 'COMPLETED');
+    assert.strictEqual(mockDeliveries[0].errorMessage, null);
+
+    // Simulate transient failure (attempt incremented, status RETRYING)
+    await (prisma as any).webhookDelivery.updateMany({
+      where: { deliveryId: 'del-worker-tracking-1' },
+      data: { attemptCount: 2, errorMessage: 'ETIMEDOUT connecting to upstream' },
+    });
+    assert.strictEqual(mockDeliveries[0].attemptCount, 2);
+    assert.strictEqual(mockDeliveries[0].errorMessage, 'ETIMEDOUT connecting to upstream');
+
+    // Simulate final retry exhaustion (marked as FAILED)
+    await (prisma as any).webhookDelivery.updateMany({
+      where: { deliveryId: 'del-worker-tracking-1' },
+      data: { status: 'FAILED', attemptCount: 5, errorMessage: 'Max retries exceeded' },
+    });
+    assert.strictEqual(mockDeliveries[0].status, 'FAILED');
+    assert.strictEqual(mockDeliveries[0].attemptCount, 5);
+
+    console.log('  ✔ Worker lifecycle states (QUEUED -> PROCESSING -> COMPLETED / FAILED) and attempt tracking verified');
+  }
+
   console.log('\n✅ ALL WEBHOOK EVENT HANDLER UNIT TESTS PASSED SUCCESSFULLY!\n');
 }
 

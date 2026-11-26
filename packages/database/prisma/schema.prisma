@@ -65,6 +65,7 @@ enum SyncRunStatus {
 
 enum WebhookDeliveryStatus {
   RECEIVED
+  QUEUED
   PROCESSING
   COMPLETED
   FAILED
