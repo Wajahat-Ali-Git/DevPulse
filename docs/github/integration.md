@@ -187,14 +187,63 @@ if (!isValid) {
 }
 ```
 
-### 5.3. Idempotency & Delivery Guarantees
-GitHub sends a unique delivery GUID in the `X-GitHub-Delivery` header. DevPulse tracks this in the `activity_events` database table:
-- **Column**: `github_delivery` (`VARCHAR(255) UNIQUE`)
-- **Behavior**: If GitHub re-transmits a webhook event, the database unique constraint prevents duplicate processing and state corruption.
+### 5.3. Idempotency, Reliability & Recovery Guarantees
+GitHub sends a unique delivery GUID in the `X-GitHub-Delivery` header. DevPulse guarantees idempotent, fault-tolerant processing using:
+- **`WebhookDelivery` Model**: Persists delivery records with a unique constraint on `deliveryId`.
+  - Duplicate delivery IDs from GitHub are detected at ingestion and acknowledged with 200/202 without re-enqueuing duplicate jobs.
+  - Safe concurrent insertion handling (`P2002` conflict catch) ensures simultaneous duplicate deliveries do not cause race conditions.
+  - BullMQ jobs use stable identifiers (`jobId = deliveryId`) so repeated enqueues are ignored by the queue manager.
+- **Handling Application Restarts**:
+  - Event metadata and raw payloads are persisted to PostgreSQL **before** dispatching to the queue (`persist-before-enqueue`).
+  - If the API or Redis restarts, events already accepted are never lost.
+  - On startup, `WebhooksQueueService` automatically runs `recoverUnqueuedDeliveries()` to sweep and enqueue deliveries in `RECEIVED` status.
+- **Stuck Processing Worker Recovery**:
+  - `WebhookWorker.recoverStuckProcessingDeliveries()` automatically scans on startup for deliveries in `PROCESSING` status older than the timeout threshold (e.g. from an ungraceful host crash or OOM kill).
+  - Deliveries with remaining retry quota are safely reset to `QUEUED` for immediate processing; deliveries exceeding max attempts are marked `FAILED` for auditing and manual reprocessing.
+- **Queue Independence**:
+  - Ingress and webhook verification run in `@devpulse/api` independently of queue or worker health. Even if Redis or the worker tier is temporarily offline, webhooks are acknowledged (202 Accepted) and persisted safely to PostgreSQL.
+- **Safe Reprocessing**:
+  - Admin endpoints (`POST /api/v1/webhooks/deliveries/:id/reprocess` and `POST /api/v1/webhooks/deliveries/recover`) allow operational triggering of recovery and re-enqueueing of failed deliveries without data loss.
+- **Entities Deduplication**: Downstream event handlers use database unique constraints:
+  - Commits: `(repositoryId, sha)`
+  - Pull Requests: `githubId` and `(repositoryId, number)`
+  - Reviews: `githubId`
+  - Activity Events: `github_delivery` (`VARCHAR(255) UNIQUE`)
+  - Webhook delivery retry attempts update existing records rather than creating duplicate activity records.
 
 ---
 
-## 6. Rate Limiting & Resilience
+## 6. Asynchronous Webhook Event Processing
+
+DevPulse processes supported webhook event types in background workers (`@devpulse/worker`) via the `github-webhooks` BullMQ queue.
+
+### 6.1. Supported Event Types & Handlers
+
+Webhook event handling is implemented by `WebhookEventHandlers` (`apps/worker/src/processors/webhook-event.handlers.ts`):
+
+1. **Push Events (`push`)**:
+   - Validates repository ownership against connected GitHub accounts.
+   - Extracts commit references and upserts commit records (`repositoryId`, `sha`, `message`, `authorName`, `authorEmail`, `authoredAt`).
+   - Updates repository activity timestamps (`pushedAt`, `lastSyncedAt`, `lastCommitSyncAt`).
+2. **Pull Request Events (`pull_request`)**:
+   - Handles actions: `opened`, `edited`, `synchronized`, `reopened`, `closed`.
+   - Distinguishes **`MERGED`** vs merely **`CLOSED`**: PRs with `merged_at` or `merged: true` are recorded as `MERGED` with `isMerged: true`. Unmerged closed PRs are recorded as `CLOSED` with `isMerged: false`.
+   - Upserts PR metadata: title, body, state, source/target branches (`head.ref`, `base.ref`), author, draft status, and timestamps.
+3. **Pull Request Review Events (`pull_request_review`)**:
+   - Handles review actions: `submitted`, `edited`, `dismissed`.
+   - Maps GitHub review states to `ReviewState` enum (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`).
+   - Persists review metadata: author username, commit SHA, submitted timestamp, and review body.
+4. **Repository Lifecycle Events (`repository`)**:
+   - Handles lifecycle actions: `archived`, `unarchived`, `deleted`, `renamed`.
+   - Updates repository operational status: `ARCHIVED`, `ACTIVE`, or `INACTIVE` (`deleted`).
+   - Updates repository metadata (name, full name, private visibility).
+5. **Ping & Untracked Events**:
+   - GitHub ping events are handled cleanly during ingestion.
+   - Events for repositories not connected to any DevPulse workspace are safely ignored with status `IGNORED` without mutating database state or failing the worker.
+
+---
+
+## 7. Rate Limiting & Resilience
 
 GitHub enforces rate limits (e.g., 5,000 requests per hour for authenticated requests). The `@devpulse/github` package includes built-in safeguards:
 
@@ -265,3 +314,72 @@ The test suite verifies:
 - OAuth authorization URL construction
 - Webhook signature verification and invalid signature rejection
 - Rate limit parsing and error hierarchy
+
+---
+
+## 9. Webhook Event Processing & Troubleshooting Guide
+
+### 9.1. Webhook Delivery States Lifecycle
+
+Each incoming GitHub delivery progresses through well-defined lifecycle states recorded in the `webhook_deliveries` table:
+
+```
+[ GitHub ]
+    │
+    ▼ POST /api/v1/webhooks/github (HMAC SHA-256 verified)
+┌──────────────┐
+│   RECEIVED   │ ◄── Durably persisted to PostgreSQL before HTTP 202 acknowledgement
+└──────┬───────┘
+       │
+       ▼ Enqueued to BullMQ 'github-webhooks'
+┌──────────────┐
+│    QUEUED    │ ◄── Stable BullMQ jobId = deliveryId
+└──────┬───────┘
+       │
+       ▼ Worker dequeues job & increments attemptCount
+┌──────────────┐
+│  PROCESSING  │
+└──────┬───────┘
+       ├─────────────────────────────────┐
+       │ (Success)                       │ (Failure)
+       ▼                                 ▼
+┌──────────────┐                 ┌──────────────┐
+│  COMPLETED   │                 │    FAILED    │ ◄── Permanent failure or retries exhausted (5)
+└──────────────┘                 └──────┬───────┘
+                                        │
+                                        ▼ POST /api/v1/webhooks/deliveries/:id/reprocess
+                                 ┌──────────────┐
+                                 │    QUEUED    │ ◄── Re-enqueued with fresh correlation tracking
+                                 └──────────────┘
+```
+
+### 9.2. Troubleshooting Common Webhook Issues
+
+#### 1. Delivery Marked as `FAILED`
+- **Symptom**: `WebhookDelivery.status` is `FAILED` with an `errorMessage`.
+- **Diagnosis**: Inspect error message and `attemptCount` via:
+  ```http
+  GET /api/v1/webhooks/deliveries/:deliveryIdOrUuid
+  ```
+- **Resolution**:
+  - If failure was transient (network hiccup, upstream GitHub API outage, temporary database lock), trigger safe reprocessing:
+    ```http
+    POST /api/v1/webhooks/deliveries/:deliveryIdOrUuid/reprocess
+    ```
+  - If failure was permanent (`UnrecoverableError` due to untracked repository or schema violation), verify whether the repository is linked in the DevPulse workspace.
+
+#### 2. Delivery Stuck in `RECEIVED` (Persisted but Unqueued)
+- **Symptom**: Delivery was accepted during a Redis outage and never queued.
+- **Diagnosis**: `status = 'RECEIVED'` with `processedAt = null`.
+- **Resolution**: The system automatically sweeps unqueued deliveries on API startup. To trigger an immediate manual recovery sweep:
+  ```http
+  POST /api/v1/webhooks/deliveries/recover
+  ```
+
+#### 3. Worker Crash During Execution (Stuck in `PROCESSING`)
+- **Symptom**: Worker was abruptly terminated (e.g. host reboot or OOM kill) while processing.
+- **Resolution**: `WebhookWorker.recoverStuckProcessingDeliveries()` automatically scans on worker startup for deliveries stuck in `PROCESSING` longer than 15 minutes, safely resetting them to `QUEUED` for immediate processing or marking them `FAILED` if max attempts were exhausted.
+
+#### 4. Duplicate Delivery Handling
+- **Symptom**: GitHub re-sends the same event delivery GUID (`X-GitHub-Delivery`).
+- **Behavior**: Ingress detects the existing `deliveryId` in the database, returns HTTP 200/202, and skips queueing. Activity records and domain entities (`commits`, `pull_requests`, `reviews`) are protected by database uniqueness constraints, guaranteeing zero duplicate data.

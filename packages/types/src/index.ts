@@ -230,17 +230,32 @@ export enum JobPriority {
 }
 
 /**
+ * Status of a webhook delivery processing lifecycle.
+ */
+export type WebhookDeliveryStatus =
+  | 'RECEIVED'
+  | 'QUEUED'
+  | 'PROCESSING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'IGNORED';
+
+/**
  * Payload for GitHub webhook processing job.
  */
 export interface WebhookEventPayload {
+  deliveryDatabaseId?: string;
   deliveryId: string;
   event: string;
+  eventType?: string;
   action?: string;
   repositoryId?: string;
   githubRepoId?: number;
   sender?: string;
-  rawPayload: Record<string, any>;
+  rawPayload?: Record<string, any>;
   receivedAt: string;
+  attemptCount?: number;
+  correlationId?: string;
 }
 
 /**
