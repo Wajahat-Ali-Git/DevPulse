@@ -321,6 +321,34 @@ Audit log and event stream of GitHub webhooks and developer activities.
   - `activity_events_actor_username_idx` (`actor_username`)
   - `activity_events_occurred_at_idx` (`occurred_at`)
 
+### 8. `webhook_deliveries`
+Persistent store for incoming GitHub webhook delivery records to ensure crash-resilient asynchronous processing, deduplication, and replay capability.
+- **Primary Key**: `id` (UUID)
+- **Unique Constraints**: `delivery_id` (GitHub delivery GUID from `X-GitHub-Delivery`)
+- **Foreign Keys**:
+  - `repository_id` -> `repositories(id)` (ON DELETE SET NULL, nullable)
+- **Enums**: `WebhookDeliveryStatus` (`RECEIVED`, `PROCESSING`, `COMPLETED`, `FAILED`, `IGNORED`)
+- **Key Fields**:
+  - `delivery_id`: Stable unique identifier from GitHub for idempotent ingestion and deduplication.
+  - `event_type`: Event name from `X-GitHub-Event` (`push`, `pull_request`, etc.).
+  - `action`: Event action (e.g., `opened`, `submitted`, `created`).
+  - `github_repository_id`: External GitHub repository ID.
+  - `sender_github_id`: External GitHub sender user ID.
+  - `payload`: Validated full JSON payload stored for replay and worker processing.
+  - `status`: Lifecycle processing state (`RECEIVED` -> `PROCESSING` -> `COMPLETED` / `FAILED`).
+  - `received_at`: Exact timestamp when the webhook hit the API.
+  - `attempt_count`: Number of asynchronous processing attempts.
+  - `error_message`: Error message if processing failed.
+- **Indexes**:
+  - `webhook_deliveries_delivery_id_idx` (`delivery_id`)
+  - `webhook_deliveries_event_type_idx` (`event_type`)
+  - `webhook_deliveries_status_idx` (`status`)
+  - `webhook_deliveries_repository_id_idx` (`repository_id`)
+  - `webhook_deliveries_github_repository_id_idx` (`github_repository_id`)
+  - `webhook_deliveries_received_at_idx` (`received_at`)
+- **Retention Policy**:
+  - Payload data is retained for 30 days for debugging, replay, and auditability before automated pruning of raw payloads.
+
 ---
 
 ## Database Setup & Workflow
