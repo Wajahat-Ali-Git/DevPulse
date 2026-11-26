@@ -187,17 +187,29 @@ if (!isValid) {
 }
 ```
 
-### 5.3. Idempotency & Delivery Guarantees
-GitHub sends a unique delivery GUID in the `X-GitHub-Delivery` header. DevPulse guarantees idempotent processing using:
+### 5.3. Idempotency, Reliability & Recovery Guarantees
+GitHub sends a unique delivery GUID in the `X-GitHub-Delivery` header. DevPulse guarantees idempotent, fault-tolerant processing using:
 - **`WebhookDelivery` Model**: Persists delivery records with a unique constraint on `deliveryId`.
   - Duplicate delivery IDs from GitHub are detected at ingestion and acknowledged with 200/202 without re-enqueuing duplicate jobs.
-  - Safe concurrent insertion handling ensures simultaneous duplicate deliveries do not cause race conditions.
+  - Safe concurrent insertion handling (`P2002` conflict catch) ensures simultaneous duplicate deliveries do not cause race conditions.
   - BullMQ jobs use stable identifiers (`jobId = deliveryId`) so repeated enqueues are ignored by the queue manager.
+- **Handling Application Restarts**:
+  - Event metadata and raw payloads are persisted to PostgreSQL **before** dispatching to the queue (`persist-before-enqueue`).
+  - If the API or Redis restarts, events already accepted are never lost.
+  - On startup, `WebhooksQueueService` automatically runs `recoverUnqueuedDeliveries()` to sweep and enqueue deliveries in `RECEIVED` status.
+- **Stuck Processing Worker Recovery**:
+  - `WebhookWorker.recoverStuckProcessingDeliveries()` automatically scans on startup for deliveries in `PROCESSING` status older than the timeout threshold (e.g. from an ungraceful host crash or OOM kill).
+  - Deliveries with remaining retry quota are safely reset to `QUEUED` for immediate processing; deliveries exceeding max attempts are marked `FAILED` for auditing and manual reprocessing.
+- **Queue Independence**:
+  - Ingress and webhook verification run in `@devpulse/api` independently of queue or worker health. Even if Redis or the worker tier is temporarily offline, webhooks are acknowledged (202 Accepted) and persisted safely to PostgreSQL.
+- **Safe Reprocessing**:
+  - Admin endpoints (`POST /api/v1/webhooks/deliveries/:id/reprocess` and `POST /api/v1/webhooks/deliveries/recover`) allow operational triggering of recovery and re-enqueueing of failed deliveries without data loss.
 - **Entities Deduplication**: Downstream event handlers use database unique constraints:
   - Commits: `(repositoryId, sha)`
   - Pull Requests: `githubId` and `(repositoryId, number)`
   - Reviews: `githubId`
-  - Webhook delivery retry attempts update existing records rather than creating duplicates.
+  - Activity Events: `github_delivery` (`VARCHAR(255) UNIQUE`)
+  - Webhook delivery retry attempts update existing records rather than creating duplicate activity records.
 
 ---
 

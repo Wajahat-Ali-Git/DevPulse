@@ -36,7 +36,7 @@ export class WebhooksService {
 
   constructor(
     private readonly database?: DatabaseService,
-    private readonly queueService?: WebhooksQueueService,
+    public readonly queueService?: WebhooksQueueService,
   ) {}
 
   /**

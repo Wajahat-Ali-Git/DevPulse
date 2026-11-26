@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { Queue, ConnectionOptions } from 'bullmq';
 import { QueueName, JobName, WebhookEventPayload } from '@devpulse/types';
 import { Logger } from '@devpulse/logger';
@@ -29,7 +29,7 @@ export interface RecoverUnqueuedDeliveriesOptions {
  * - Graceful lifecycle teardown on module destruction
  */
 @Injectable()
-export class WebhooksQueueService implements OnModuleDestroy {
+export class WebhooksQueueService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger({ service: 'api', context: WebhooksQueueService.name });
   private queue?: Queue;
 
@@ -37,6 +37,13 @@ export class WebhooksQueueService implements OnModuleDestroy {
     private readonly redisService?: RedisService,
     private readonly database?: DatabaseService,
   ) { }
+
+  async onModuleInit() {
+    // On API startup / restart, recover any deliveries that were persisted but never queued
+    this.recoverUnqueuedDeliveries().catch(err => {
+      this.logger.warn(`Startup unqueued delivery recovery sweep failed: ${err.message}`);
+    });
+  }
 
   public getQueue(): Queue {
     if (!this.queue) {

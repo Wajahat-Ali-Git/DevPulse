@@ -102,6 +102,19 @@ export class WebhooksController {
   }
 
   /**
+   * Trigger recovery sweep for persisted deliveries that were never queued.
+   */
+  @Roles('ADMIN')
+  @Post('deliveries/recover')
+  @HttpCode(HttpStatus.OK)
+  async recoverUnqueuedDeliveries() {
+    if (!this.webhooksService.queueService) {
+      throw new BadRequestException('Queue service is unavailable');
+    }
+    return await this.webhooksService.queueService.recoverUnqueuedDeliveries();
+  }
+
+  /**
    * Retrieves status and details for a webhook delivery by UUID or deliveryId.
    */
   @Roles('ADMIN')

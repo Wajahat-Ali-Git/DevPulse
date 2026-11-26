@@ -28,6 +28,58 @@ export class WebhookWorker extends BaseWorker<WebhookEventPayload, WebhookJobRes
 
   onModuleInit() {
     this.startWorker();
+    // Non-blocking background sweep to recover stuck deliveries on worker restart
+    this.recoverStuckProcessingDeliveries().catch(err => {
+      this.logger.warn(`Initial stuck processing deliveries recovery sweep failed: ${err.message}`);
+    });
+  }
+
+  /**
+   * Recovers deliveries that were left permanently stuck in PROCESSING
+   * due to sudden worker crashes, out-of-memory kills, or ungraceful host restarts.
+   */
+  async recoverStuckProcessingDeliveries(maxAgeMinutes: number = 15): Promise<number> {
+    if (!prisma || !prisma.webhookDelivery) return 0;
+
+    const thresholdDate = new Date(Date.now() - maxAgeMinutes * 60 * 1000);
+    try {
+      const stuck = await prisma.webhookDelivery.findMany({
+        where: {
+          status: 'PROCESSING',
+          processedAt: null,
+          updatedAt: { lte: thresholdDate },
+        },
+        select: { id: true, deliveryId: true, attemptCount: true },
+        take: 50,
+      });
+
+      if (stuck.length === 0) return 0;
+
+      this.logger.warn(`Found ${stuck.length} delivery(ies) stuck in PROCESSING beyond ${maxAgeMinutes}m threshold. Recovering...`);
+
+      let recovered = 0;
+      for (const item of stuck) {
+        // If max attempts (5) reached, mark as FAILED so it can be audited/reprocessed safely.
+        // Otherwise, reset back to QUEUED for automatic pickup.
+        const shouldFail = item.attemptCount >= 5;
+        await prisma.webhookDelivery.update({
+          where: { id: item.id },
+          data: {
+            status: shouldFail ? 'FAILED' : 'QUEUED',
+            errorMessage: shouldFail
+              ? 'Processing timed out / worker crash after max attempts'
+              : 'Recovered from crashed/stuck worker execution',
+          },
+        });
+        recovered++;
+      }
+
+      this.logger.info(`Successfully recovered ${recovered} stuck delivery(ies)`);
+      return recovered;
+    } catch (err) {
+      this.logger.error(`Failed to execute stuck delivery recovery: ${(err as Error).message}`);
+      return 0;
+    }
   }
 
   async processJob(job: Job<WebhookEventPayload, WebhookJobResult>): Promise<WebhookJobResult> {

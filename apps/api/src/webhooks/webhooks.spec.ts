@@ -1027,6 +1027,9 @@ async function runWebhookTests() {
         });
         return { enqueued: true, jobId: payload.deliveryId };
       },
+      recoverUnqueuedDeliveries: async () => {
+        return { recoveredCount: 0, errors: 0 };
+      },
       reprocessFailedDelivery: async (idOrDeliveryId: string) => {
         const item = await mockDb.client.webhookDelivery.findFirst({
           where: { OR: [{ id: idOrDeliveryId }, { deliveryId: idOrDeliveryId }] },
@@ -1082,6 +1085,10 @@ async function runWebhookTests() {
     assert.strictEqual(storage[0].status, 'QUEUED');
     assert.strictEqual(storage[0].errorMessage, null);
     assert.strictEqual(enqueuedJobs.length, 2);
+
+    // 16.5 Recover unqueued deliveries endpoint
+    const recoveryRes = await testController.recoverUnqueuedDeliveries();
+    assert.ok(typeof recoveryRes.recoveredCount === 'number');
 
     console.log('  ✔ Delivery lifecycle status transitions (RECEIVED -> QUEUED -> FAILED -> reprocessed) verified');
   }

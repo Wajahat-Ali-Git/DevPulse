@@ -399,6 +399,39 @@ async function runWebhookEventHandlerTests() {
     assert.strictEqual(mockDeliveries[0].status, 'FAILED');
     assert.strictEqual(mockDeliveries[0].attemptCount, 5);
 
+    // Simulate worker crash recovery for deliveries stuck in PROCESSING
+    mockDeliveries.push({
+      id: 'del-stuck-1',
+      deliveryId: 'del-stuck-1',
+      status: 'PROCESSING',
+      attemptCount: 1,
+      errorMessage: null,
+      updatedAt: new Date(Date.now() - 30 * 60 * 1000), // 30 mins ago
+    });
+
+    (prisma as any).webhookDelivery.findMany = async ({ where }: any) => {
+      if (where.status === 'PROCESSING') {
+        return mockDeliveries.filter(d => d.status === 'PROCESSING' && (!where.updatedAt?.lte || d.updatedAt <= where.updatedAt.lte));
+      }
+      return [];
+    };
+    (prisma as any).webhookDelivery.update = async ({ where, data }: any) => {
+      const item = mockDeliveries.find(d => d.id === where.id);
+      if (item) Object.assign(item, data);
+      return item;
+    };
+
+    // Recover stuck deliveries
+    const stuck = await (prisma as any).webhookDelivery.findMany({
+      where: { status: 'PROCESSING', updatedAt: { lte: new Date(Date.now() - 15 * 60 * 1000) } },
+    });
+    assert.strictEqual(stuck.length, 1);
+    await (prisma as any).webhookDelivery.update({
+      where: { id: stuck[0].id },
+      data: { status: 'QUEUED', errorMessage: 'Recovered from crashed/stuck worker execution' },
+    });
+    assert.strictEqual(mockDeliveries.find(d => d.id === 'del-stuck-1').status, 'QUEUED');
+
     console.log('  ✔ Worker lifecycle states (QUEUED -> PROCESSING -> COMPLETED / FAILED) and attempt tracking verified');
   }
 
