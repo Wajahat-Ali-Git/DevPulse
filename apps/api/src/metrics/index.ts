@@ -1,5 +1,6 @@
 export { MetricsModule } from './metrics.module';
 export { CommitMetricsService } from './commit-metrics.service';
+export { PrMetricsService } from './pr-metrics.service';
 export type {
   Granularity,
   CommitCountByDate,
@@ -7,3 +8,8 @@ export type {
   RepositoryDistributionEntry,
   CommitTrendEntry,
 } from './commit-metrics.service';
+export type {
+  PrCountSummary,
+  PrDurationMetrics,
+  PrCountByDate,
+} from './pr-metrics.service';
