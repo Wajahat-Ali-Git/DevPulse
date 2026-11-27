@@ -9,9 +9,10 @@ import { HealthModule } from './health';
 import { AuthModule, AuthMiddleware, JwtAuthGuard, RolesGuard } from './auth';
 import { RepositoriesModule } from './repositories';
 import { WebhooksModule } from './webhooks';
+import { MetricsModule } from './metrics';
 
 @Module({
-  imports: [HealthModule, AuthModule, RepositoriesModule, WebhooksModule],
+  imports: [HealthModule, AuthModule, RepositoriesModule, WebhooksModule, MetricsModule],
   controllers: [AppController],
   providers: [
     AppService,
